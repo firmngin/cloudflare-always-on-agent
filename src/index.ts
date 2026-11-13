@@ -15,10 +15,18 @@
  * `npx wrangler deploy` after filling in wrangler.toml and the two secrets:
  *   WORKER_TOKEN   - the workspace Worker token (fng_aow_...)
  *   MODEL_API_KEY  - the model provider key (never sent to Firmngin)
+ *
+ * URL_BACKEND is a plain var holding the production API base URL. A development
+ * deployment overrides it at runtime through ENVIRONMENT="development" plus
+ * URL_BACKEND_DEV, so no private tunnel URL is ever committed to this repo.
  */
 
 export interface Env {
-  API_URL: string
+  URL_BACKEND: string
+  /** "development" | "production". Unset means production. */
+  ENVIRONMENT?: string
+  /** Dev-only backend override. Ignored unless ENVIRONMENT is development. */
+  URL_BACKEND_DEV?: string
   WORKER_TOKEN: string
   MODEL_API_KEY: string
   MODEL_BASE_URL?: string
@@ -580,8 +588,17 @@ async function queueScheduledRuns(agents: WorkerAgent[]): Promise<void> {
   }
 }
 
+function resolveBackendUrl(env: Env): string {
+  const isDev = String(env.ENVIRONMENT || '').trim().toLowerCase() === 'development'
+  const devUrl = String(env.URL_BACKEND_DEV || '').trim()
+  // The dev override only applies when the deployment is explicitly marked as
+  // development, so a stray URL_BACKEND_DEV on production cannot redirect it.
+  if (isDev && devUrl) return trimSlash(devUrl)
+  return trimSlash(String(env.URL_BACKEND || '').trim())
+}
+
 function applyEnv(env: Env) {
-  apiUrl = env.API_URL || ''
+  apiUrl = resolveBackendUrl(env)
   workerToken = env.WORKER_TOKEN || ''
   modelApiKey = env.MODEL_API_KEY || ''
   modelBase = env.MODEL_BASE_URL || ''
@@ -589,14 +606,13 @@ function applyEnv(env: Env) {
 }
 
 function isConfigured(): boolean {
-  return Boolean(workerToken)
+  return Boolean(workerToken) && Boolean(apiUrl)
 }
-
 export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     applyEnv(env)
     if (!isConfigured()) {
-      console.error('Worker is not configured: set WORKER_TOKEN (secret)')
+      console.error('Worker is not configured: set URL_BACKEND (var) and WORKER_TOKEN (secret)')
       return
     }
     ctx.waitUntil((async () => {
@@ -619,13 +635,18 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     applyEnv(env)
     if (!isConfigured()) {
-      return Response.json({ ok: false, error: 'Worker is not configured: set WORKER_TOKEN (secret)' }, { status: 500 })
+      return Response.json({ ok: false, error: 'Worker is not configured: set URL_BACKEND (var) and WORKER_TOKEN (secret)' }, { status: 500 })
     }
     if (request.method === 'POST') {
       ctx.waitUntil(drainInbox())
       return Response.json({ ok: true, draining: true })
     }
     ctx.waitUntil(heartbeat())
-    return Response.json({ ok: true, version: WORKER_VERSION })
+    return Response.json({
+      ok: true,
+      version: WORKER_VERSION,
+      environment: String(env.ENVIRONMENT || '').toLowerCase() === 'development' ? 'development' : 'production',
+      backend: apiUrl,
+    })
   },
 }

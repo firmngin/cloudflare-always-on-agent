@@ -37,6 +37,35 @@ npx wrangler secret put MODEL_API_KEY
 npx wrangler deploy
 ```
 
+`URL_BACKEND` in `wrangler.toml` points at the production API. It is committed
+as production only.
+
+## Local development against a private backend
+
+A development deployment overrides the backend at runtime, so no tunnel URL is
+ever committed:
+
+```bash
+# vars for this deployment only
+npx wrangler deploy --env development
+# or, on the plain Worker: add ENVIRONMENT=development and URL_BACKEND_DEV
+```
+
+| Variable | Meaning |
+|---|---|
+| `ENVIRONMENT` | `development` enables the override. Unset or any other value means production. |
+| `URL_BACKEND_DEV` | Dev-only API base URL. Ignored unless `ENVIRONMENT=development`. |
+
+For `wrangler dev`, put both values in `.dev.vars` (git-ignored):
+
+```ini
+ENVIRONMENT=development
+URL_BACKEND_DEV=https://your-dev-backend
+```
+
+`GET /` reports the resolved `environment` and `backend`, so you can confirm
+which backend a deployment is actually talking to.
+
 ## What it does on each cron tick
 
 1. Sends a heartbeat (drives the "Worker connected" status in the dashboard).

@@ -9,8 +9,13 @@ compatibility_date = "2026-11-01"
 crons = ["0 * * * *"]
 
 [vars]
-# Firmngin API base URL. Change only if you self-host the backend.
-API_URL = "https://api.fwng.in"
+# Production API base URL. This is the only backend committed to the repo.
+#
+# Local/development deployments override it at runtime through either:
+#   ENVIRONMENT    = "development"   (var, set on the dev deployment)
+#   URL_BACKEND_DEV = <your tunnel>  (var, set on the dev deployment only)
+# Nothing about a private tunnel belongs in this file.
+URL_BACKEND = "https://api.firmngin.dev"
 
 # Any OpenAI-compatible chat endpoint works (OpenRouter, OpenAI, Groq, ...).
 # The model id from each agent's config is passed through unchanged.

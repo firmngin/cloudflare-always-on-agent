@@ -1,0 +1,5 @@
+# Cloudflare reads this file when you use the "Deploy to Cloudflare" button, so
+# the wizard knows which secrets to ask for. Values here are placeholders only;
+# never commit real secrets.
+WORKER_TOKEN=replace_with_fng_aow_token_from_the_firmngin_dashboard
+MODEL_API_KEY=replace_with_your_model_provider_key
