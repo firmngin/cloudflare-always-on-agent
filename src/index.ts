@@ -1,29 +1,31 @@
 /**
  * Firmngin data-agent runtime for Cloudflare Workers.
  *
- * The Worker is owned and deployed by the Firmngin user (BYOK): it fetches the
- * agent config, long-polls the inbox, claims turns, runs them against any
- * OpenAI-compatible model endpoint with the user's own provider key, streams
- * tool calls and deltas back to Firmngin, and reports the final result.
+ * The Worker is owned and deployed by the Firmngin user (BYOK): ONE deployment
+ * executes EVERY worker-mode agent of the workspace. It heartbeats, long-polls
+ * the merged inbox, claims turns, runs them against any OpenAI-compatible
+ * model endpoint with the user's own provider key, streams tool calls and
+ * deltas back to Firmngin, and reports the final result.
+ *
  * Firmngin never sees the model provider key and never executes the agent.
+ * Agents are created in the Firmngin dashboard — the Worker picks them up
+ * automatically; nothing here is per-agent and no redeploy is needed.
  *
  * Deploy: the Firmngin dashboard "Deploy to Cloudflare" button (this repo), or
  * `npx wrangler deploy` after filling in wrangler.toml and the two secrets:
- *   AGENT_TOKEN    - the agent's `fng_aoa_...` runtime token
+ *   WORKER_TOKEN   - the workspace Worker token (fng_aow_...)
  *   MODEL_API_KEY  - the model provider key (never sent to Firmngin)
  */
 
 export interface Env {
   API_URL: string
-  AGENT_ID: string
-  AGENT_TOKEN: string
+  WORKER_TOKEN: string
   MODEL_API_KEY: string
   MODEL_BASE_URL?: string
-  MODEL?: string
   MAX_STEPS?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/1.0.0'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.0.0'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -35,6 +37,14 @@ const MAX_TURNS_PER_INVOCATION = 10
 // crash mid-turn still leaves readable partial output behind.
 const EVENT_FLUSH_SIZE = 12
 
+// Per-invocation configuration captured from the env binding; module-scope so
+// every helper reads it without threading the env object through each call.
+let apiUrl = ''
+let workerToken = ''
+let modelApiKey = ''
+let modelBase = ''
+let maxStepsEnv = ''
+
 type Role = 'system' | 'user' | 'assistant' | 'tool'
 
 interface ChatMessage {
@@ -45,7 +55,16 @@ interface ChatMessage {
   name?: string
 }
 
+interface WorkerAgent {
+  id: string
+  name: string
+  model: string
+  enabled: boolean
+  config_revision: number
+}
+
 interface InboxItem {
+  agent_id: string
   message: { id: number, role: string, content: string }
   run_id: string
   conversation_id: string
@@ -75,15 +94,15 @@ class ApiError extends Error {
 
 const trimSlash = (value: string) => String(value || '').replace(/\/+$/, '')
 
-function runtimeUrl(env: Env, path: string): string {
-  return `${trimSlash(env.API_URL)}/api/v1/agent-runtime/agents/${encodeURIComponent(env.AGENT_ID)}${path}`
+function runtimeUrl(path: string): string {
+  return `${trimSlash(apiUrl)}/api/v1/agent-runtime/worker${path}`
 }
 
-async function agentFetch(env: Env, path: string, init: RequestInit = {}): Promise<Response> {
-  const response = await fetch(runtimeUrl(env, path), {
+async function agentFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const response = await fetch(runtimeUrl(path), {
     ...init,
     headers: {
-      Authorization: `Bearer ${env.AGENT_TOKEN}`,
+      Authorization: `Bearer ${workerToken}`,
       'Content-Type': 'application/json',
       ...(init.headers || {}),
     },
@@ -120,7 +139,7 @@ class EventStream {
   private pending: Record<string, unknown>[] = []
 
   constructor(
-    private readonly env: Env,
+    private readonly agentId: string,
     private readonly runId: string,
     private readonly conversationId: string,
   ) {}
@@ -136,17 +155,13 @@ class EventStream {
     })
   }
 
-  get size(): number {
-    return this.pending.length
-  }
-
   async flush(): Promise<void> {
     if (!this.pending.length) return
     const events = this.pending
     this.pending = []
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const response = await agentFetch(this.env, `/runs/${this.runId}/events`, {
+        const response = await agentFetch(`/agents/${this.agentId}/runs/${this.runId}/events`, {
           method: 'POST',
           body: JSON.stringify({ events }),
         })
@@ -202,13 +217,12 @@ interface ModelTurnResult {
 }
 
 async function callModel(
-  env: Env,
   model: string,
   messages: ChatMessage[],
   tools: McpTool[],
   onDelta: (text: string) => Promise<void>,
 ): Promise<ModelTurnResult> {
-  const base = trimSlash(env.MODEL_BASE_URL || 'https://openrouter.ai/api/v1')
+  const base = trimSlash(modelBase || 'https://openrouter.ai/api/v1')
   const body: Record<string, unknown> = { model, messages, stream: true }
   if (tools.length) {
     body.tools = tools.map((tool) => ({
@@ -220,7 +234,7 @@ async function callModel(
   const response = await fetch(`${base}/chat/completions`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${env.MODEL_API_KEY}`,
+      Authorization: `Bearer ${modelApiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -363,11 +377,12 @@ class McpClient {
   }
 }
 
-async function connectMcp(env: Env): Promise<McpClient | null> {
+async function connectMcp(agentId: string): Promise<McpClient | null> {
   try {
-    const response = await agentFetch(env, '/mcp-token', { method: 'POST', body: '{}' })
+    const response = await agentFetch(`/agents/${agentId}/mcp-token`, { method: 'POST', body: '{}' })
     if (!response.ok) return null
-    const token: any = await response.json()
+    const payload: any = await response.json()
+    const token = payload?.data || payload
     if (!token?.access_token || !token?.mcp_url) return null
     return await McpClient.connect(token.mcp_url, token.access_token)
   } catch (error) {
@@ -380,34 +395,33 @@ async function connectMcp(env: Env): Promise<McpClient | null> {
 // Turn execution
 // ---------------------------------------------------------------------------
 
-async function drainInbox(env: Env): Promise<void> {
+async function drainInbox(): Promise<void> {
   for (let handled = 0; handled < MAX_TURNS_PER_INVOCATION; handled++) {
     let items: InboxItem[]
     try {
       const response = await agentFetch(
-        env,
         `/inbox?wait=${INBOX_WAIT_SECONDS}&limit=${INBOX_BATCH}`,
         { method: 'GET' },
       )
       const payload: any = await response.json()
       items = Array.isArray(payload?.data) ? payload.data : []
     } catch (error) {
-      // 401/403 (revoked or disabled agent) must not spin the cron loop
+      // 401/403 (revoked token) must not spin the cron loop
       console.error('inbox poll failed:', error instanceof Error ? error.message : error)
       return
     }
     if (!items.length) return
     for (const item of items) {
-      await executeInboxItem(env, item)
+      await executeInboxItem(item)
     }
   }
 }
 
-async function executeInboxItem(env: Env, item: InboxItem): Promise<void> {
+async function executeInboxItem(item: InboxItem): Promise<void> {
   const claimToken = crypto.randomUUID()
   let claim: Claim
   try {
-    const response = await agentFetch(env, `/inbox/${item.message.id}/claim`, {
+    const response = await agentFetch(`/agents/${item.agent_id}/inbox/${item.message.id}/claim`, {
       method: 'POST',
       headers: { 'X-Claim-Token': claimToken },
       body: '{}',
@@ -419,21 +433,21 @@ async function executeInboxItem(env: Env, item: InboxItem): Promise<void> {
     return
   }
   if (!claim?.run_id) return
-  await runTurn(env, claim)
+  await runTurn(item.agent_id, claim)
 }
 
-async function runTurn(env: Env, claim: Claim): Promise<void> {
-  const events = new EventStream(env, claim.run_id, claim.conversation_id)
+async function runTurn(agentId: string, claim: Claim): Promise<void> {
+  const events = new EventStream(agentId, claim.run_id, claim.conversation_id)
   const started = Date.now()
   try {
     await events.pushAndFlush('message.start')
     const output = await withTimeout(
-      executeTurn(env, claim, events),
+      executeTurn(agentId, claim, events),
       TURN_TIMEOUT_MS,
       'Turn exceeded the time budget',
     )
     await events.pushAndFlush('message.final', output)
-    await finishRun(env, claim, {
+    await finishRun(agentId, claim, {
       status: 'succeeded',
       content: output,
       output,
@@ -444,7 +458,7 @@ async function runTurn(env: Env, claim: Claim): Promise<void> {
     const code = error instanceof ApiError && error.errorCode ? error.errorCode : 'WORKER_ERROR'
     console.error(`run ${claim.run_id} failed:`, message)
     await events.pushAndFlush('error', message).catch(() => {})
-    await finishRun(env, claim, {
+    await finishRun(agentId, claim, {
       status: 'failed',
       error_code: code,
       error_message: message,
@@ -452,10 +466,10 @@ async function runTurn(env: Env, claim: Claim): Promise<void> {
   }
 }
 
-async function executeTurn(env: Env, claim: Claim, events: EventStream): Promise<string> {
-  const model = env.MODEL || claim.model
+async function executeTurn(agentId: string, claim: Claim, events: EventStream): Promise<string> {
+  const model = claim.model
   if (!model) throw new ApiError(0, 'Agent config has no model', 'CONFIG_INVALID')
-  const mcp = await connectMcp(env)
+  const mcp = await connectMcp(agentId)
   const tools = mcp?.tools || []
 
   const messages: ChatMessage[] = [
@@ -466,10 +480,10 @@ async function executeTurn(env: Env, claim: Claim, events: EventStream): Promise
     { role: 'user', content: claim.message?.content || '' },
   ]
 
-  const maxSteps = Math.max(1, Number(env.MAX_STEPS || 8))
+  const maxSteps = Math.max(1, Number(maxStepsEnv || 8))
   let finalContent = ''
   for (let step = 0; step < maxSteps; step++) {
-    const result = await callModel(env, model, messages, tools, async (text) => {
+    const result = await callModel(model, messages, tools, async (text) => {
       events.push('delta', text)
       await events.flushIfLarge()
     })
@@ -522,7 +536,7 @@ function summarize(value: string): string {
   return text.length > 240 ? `${text.slice(0, 240)}…` : text
 }
 
-async function finishRun(env: Env, claim: Claim, report: {
+async function finishRun(agentId: string, claim: Claim, report: {
   status: 'succeeded' | 'failed'
   content?: string
   output?: string
@@ -530,7 +544,7 @@ async function finishRun(env: Env, claim: Claim, report: {
   error_message?: string
 }): Promise<void> {
   try {
-    await agentFetch(env, `/runs/${claim.run_id}`, {
+    await agentFetch(`/agents/${agentId}/runs/${claim.run_id}`, {
       method: 'PATCH',
       body: JSON.stringify(report),
     })
@@ -539,9 +553,9 @@ async function finishRun(env: Env, claim: Claim, report: {
   }
 }
 
-async function heartbeat(env: Env): Promise<void> {
+async function heartbeat(): Promise<void> {
   try {
-    await agentFetch(env, '/heartbeat', {
+    await agentFetch('/heartbeat', {
       method: 'POST',
       body: JSON.stringify({ version: WORKER_VERSION }),
     })
@@ -550,47 +564,68 @@ async function heartbeat(env: Env): Promise<void> {
   }
 }
 
-function isConfigured(env: Env): boolean {
-  if (!env.AGENT_ID || env.AGENT_ID === 'REPLACE_WITH_AGENT_ID') return false
-  if (!env.AGENT_TOKEN) return false
-  return true
+// Hour-bucket idempotency key per agent: a retried cron within the same hour
+// returns the existing queued turn instead of duplicating it.
+async function queueScheduledRuns(agents: WorkerAgent[]): Promise<void> {
+  const hourBucket = new Date().toISOString().slice(0, 13)
+  for (const agent of agents) {
+    try {
+      await agentFetch(`/agents/${agent.id}/scheduled-runs`, {
+        method: 'POST',
+        body: JSON.stringify({ idempotency_key: `${agent.id}:${hourBucket}` }),
+      })
+    } catch (error) {
+      console.error(`scheduled run for agent ${agent.id} failed:`, error instanceof Error ? error.message : error)
+    }
+  }
+}
+
+function applyEnv(env: Env) {
+  apiUrl = env.API_URL || ''
+  workerToken = env.WORKER_TOKEN || ''
+  modelApiKey = env.MODEL_API_KEY || ''
+  modelBase = env.MODEL_BASE_URL || ''
+  maxStepsEnv = env.MAX_STEPS || ''
+}
+
+function isConfigured(): boolean {
+  return Boolean(workerToken)
 }
 
 export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    if (!isConfigured(env)) {
-      console.error('Worker is not configured: set AGENT_ID (var) and AGENT_TOKEN (secret)')
+    applyEnv(env)
+    if (!isConfigured()) {
+      console.error('Worker is not configured: set WORKER_TOKEN (secret)')
       return
     }
     ctx.waitUntil((async () => {
-      await heartbeat(env)
-      // Hour-bucket idempotency key: a retried cron within the same hour
-      // returns the existing queued turn instead of duplicating it.
-      const idempotencyKey = `${env.AGENT_ID}:${new Date().toISOString().slice(0, 13)}`
+      await heartbeat()
+      let agents: WorkerAgent[] = []
       try {
-        await agentFetch(env, '/scheduled-runs', {
-          method: 'POST',
-          body: JSON.stringify({ idempotency_key: idempotencyKey }),
-        })
+        const response = await agentFetch('/agents', { method: 'GET' })
+        const payload: any = await response.json()
+        agents = Array.isArray(payload?.data) ? payload.data : []
       } catch (error) {
-        console.error('scheduled-runs failed:', error instanceof Error ? error.message : error)
-        return
+        console.error('listing agents failed:', error instanceof Error ? error.message : error)
       }
-      await drainInbox(env)
+      await queueScheduledRuns(agents)
+      await drainInbox()
     })())
   },
 
   // GET  / -> heartbeat probe (handy to verify the deploy works)
   // POST / -> drain the inbox now (manual "run pending turns" trigger)
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (!isConfigured(env)) {
-      return Response.json({ ok: false, error: 'Worker is not configured: set AGENT_ID (var) and AGENT_TOKEN (secret)' }, { status: 500 })
+    applyEnv(env)
+    if (!isConfigured()) {
+      return Response.json({ ok: false, error: 'Worker is not configured: set WORKER_TOKEN (secret)' }, { status: 500 })
     }
     if (request.method === 'POST') {
-      ctx.waitUntil(drainInbox(env))
+      ctx.waitUntil(drainInbox())
       return Response.json({ ok: true, draining: true })
     }
-    ctx.waitUntil(heartbeat(env))
-    return Response.json({ ok: true, agent_id: env.AGENT_ID, version: WORKER_VERSION })
+    ctx.waitUntil(heartbeat())
+    return Response.json({ ok: true, version: WORKER_VERSION })
   },
 }

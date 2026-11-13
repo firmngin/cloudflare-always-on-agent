@@ -2,8 +2,9 @@ name = "firmngin-data-agent"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
 
-# Runs the scheduled turn once an hour. Edit here or in the Cloudflare
-# dashboard (Worker -> Triggers -> Cron) after deploying.
+# Runs the scheduled turn once an hour for every enabled agent of the
+# workspace. Edit here or in the Cloudflare dashboard (Worker -> Triggers ->
+# Cron) after deploying.
 [triggers]
 crons = ["0 * * * *"]
 
@@ -11,13 +12,14 @@ crons = ["0 * * * *"]
 # Firmngin API base URL. Change only if you self-host the backend.
 API_URL = "https://api.fwng.in"
 
-# The data agent this Worker executes. The deploy wizard asks for it —
-# copy the value from the Firmngin dashboard (agent settings -> Access).
-AGENT_ID = "REPLACE_WITH_AGENT_ID"
-
 # Any OpenAI-compatible chat endpoint works (OpenRouter, OpenAI, Groq, ...).
-# The model id from the agent config is passed through unchanged.
+# The model id from each agent's config is passed through unchanged.
 MODEL_BASE_URL = "https://openrouter.ai/api/v1"
 
 # Safety bound for tool-calling steps inside one turn.
 MAX_STEPS = "8"
+
+# Secrets (set in the deploy wizard or `wrangler secret put`):
+#   WORKER_TOKEN  - the workspace Worker token (fng_aow_...) shown once in the
+#                   Firmngin dashboard. One deployment serves every agent.
+#   MODEL_API_KEY - your model provider key; never sent to Firmngin.
