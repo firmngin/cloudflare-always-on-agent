@@ -7,6 +7,14 @@
  * model endpoint with the user's own provider key, streams tool calls and
  * deltas back to Firmngin, and reports the final result.
  *
+ * Inbox pickup is adaptive: the backend answers the long-poll instantly while
+ * the workspace is idle (the once-a-minute cron tick stays the fallback) and
+ * holds an active workspace's request until a turn is queued, so replies
+ * usually start within seconds. Overlapping invocations are guarded on the
+ * Worker side — an in-flight drain is never started twice and at most two
+ * turns run at once — while the backend's CAS claim stays the authority
+ * against double execution.
+ *
  * Firmngin never sees the model provider key and never executes the agent.
  * Agents are created in the Firmngin dashboard — the Worker picks them up
  * automatically; nothing here is per-agent and no redeploy is needed.
@@ -30,17 +38,26 @@ export interface Env {
   WORKER_TOKEN: string
   MODEL_API_KEY: string
   MODEL_BASE_URL?: string
+  /** Output cap for providers that require it (Anthropic Messages). */
+  MODEL_MAX_TOKENS?: string
   MAX_STEPS?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.0.0'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.1.0'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
 const TURN_TIMEOUT_MS = 4 * 60_000
+// Adaptive long-poll: an active workspace holds the request until something is
+// enqueued or this wait elapses, an idle one answers instantly and the
+// once-a-minute cron tick stays the fallback. An instant empty answer is the
+// normal idle response, not an error.
 const INBOX_WAIT_SECONDS = 25
 const INBOX_BATCH = 5
 const MAX_TURNS_PER_INVOCATION = 10
+// Bounds cost when cron invocations overlap; the BE CAS claim still prevents
+// double execution, this only caps spend.
+const MAX_CONCURRENT_TURNS = 2
 // The claimed message is streamed before persisting deltas; flush batches so a
 // crash mid-turn still leaves readable partial output behind.
 const EVENT_FLUSH_SIZE = 12
@@ -52,6 +69,13 @@ let workerToken = ''
 let modelApiKey = ''
 let modelBase = ''
 let maxStepsEnv = ''
+let modelMaxTokens = ''
+
+// Overlap guards shared by every invocation on this isolate: `draining`
+// serializes inbox drains so overlapping cron/manual triggers skip instead of
+// double-polling, and `activeTurns` counts turns in flight for the spend cap.
+let draining = false
+let activeTurns = 0
 
 type Role = 'system' | 'user' | 'assistant' | 'tool'
 
@@ -67,6 +91,8 @@ interface WorkerAgent {
   id: string
   name: string
   model: string
+  provider: string
+  model_base_url: string
   enabled: boolean
   config_revision: number
 }
@@ -85,6 +111,12 @@ interface Claim {
   history: Array<{ role: string, content: string }>
   task_prompt: string
   model: string
+  // Optional so older backends keep working; the Worker falls back to its
+  // MODEL_BASE_URL env when they are absent.
+  provider?: string
+  model_base_url?: string
+  // "openai" | "anthropic": which wire format to speak for this agent.
+  model_protocol?: string
   config_revision: number
 }
 
@@ -192,7 +224,7 @@ class EventStream {
 }
 
 // ---------------------------------------------------------------------------
-// Model provider (OpenAI-compatible, BYOK)
+// Model provider (OpenAI chat completions + Anthropic Messages, BYOK)
 // ---------------------------------------------------------------------------
 
 async function* sseDataLines(response: Response): AsyncGenerator<string> {
@@ -224,13 +256,53 @@ interface ModelTurnResult {
   toolCalls: Array<{ id: string, name: string, arguments: string }>
 }
 
+type ModelProtocol = 'openai' | 'anthropic'
+
+const ANTHROPIC_PROTOCOL_PROVIDERS = new Set(['anthropic', 'claude-compatible', 'claude'])
+
+// The claim carries the protocol from the Firmngin registry; when it is
+// missing (older backend), the provider id and finally the base URL host
+// decide, so a user pointing MODEL_BASE_URL at api.anthropic.com still gets
+// the right wire format.
+function resolveModelProtocol(claim: Claim): ModelProtocol {
+  const fromClaim = String(claim.model_protocol || '').trim().toLowerCase()
+  if (fromClaim === 'anthropic' || fromClaim === 'openai') return fromClaim
+  const provider = String(claim.provider || '').trim().toLowerCase()
+  if (ANTHROPIC_PROTOCOL_PROVIDERS.has(provider)) return 'anthropic'
+  const override = trimSlash(String(claim.model_base_url || modelBase || ''))
+  if (override.includes('anthropic')) return 'anthropic'
+  return 'openai'
+}
+
+function anthropicMaxTokens(): number {
+  const parsed = Number(modelMaxTokens)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 8192
+}
+
 async function callModel(
   model: string,
   messages: ChatMessage[],
   tools: McpTool[],
   onDelta: (text: string) => Promise<void>,
+  // Per-agent base URL from the claim; the env var stays the fallback so
+  // older backends and custom deployments keep working.
+  baseUrlOverride?: string,
+  protocol: ModelProtocol = 'openai',
 ): Promise<ModelTurnResult> {
-  const base = trimSlash(modelBase || 'https://openrouter.ai/api/v1')
+  if (protocol === 'anthropic') {
+    return callAnthropicModel(model, messages, tools, onDelta, baseUrlOverride)
+  }
+  return callOpenAIModel(model, messages, tools, onDelta, baseUrlOverride)
+}
+
+async function callOpenAIModel(
+  model: string,
+  messages: ChatMessage[],
+  tools: McpTool[],
+  onDelta: (text: string) => Promise<void>,
+  baseUrlOverride?: string,
+): Promise<ModelTurnResult> {
+  const base = trimSlash(baseUrlOverride || modelBase || 'https://openrouter.ai/api/v1')
   const body: Record<string, unknown> = { model, messages, stream: true }
   if (tools.length) {
     body.tools = tools.map((tool) => ({
@@ -288,13 +360,173 @@ async function callModel(
 }
 
 // ---------------------------------------------------------------------------
+// Anthropic Messages adapter
+// ---------------------------------------------------------------------------
+
+// Anthropic's Messages API is a different wire protocol from OpenAI chat
+// completions: x-api-key auth, a required max_tokens, the system prompt as a
+// top-level parameter, tool calls as content blocks, and its own SSE events.
+// The internal ChatMessage shape stays OpenAI-ish; these helpers translate in
+// both directions so executeTurn needs no protocol awareness.
+
+function anthropicEndpoint(baseUrlOverride?: string): string {
+  const base = trimSlash(baseUrlOverride || modelBase || 'https://api.anthropic.com')
+  return `${base}/v1/messages`
+}
+
+interface AnthropicContentBlock {
+  type: string
+  text?: string
+  id?: string
+  name?: string
+  input?: Record<string, unknown>
+  tool_use_id?: string
+  content?: string | Array<{ type: string, text?: string }>
+}
+
+function toAnthropicMessages(messages: ChatMessage[]): { system: string, messages: Array<{ role: string, content: string | AnthropicContentBlock[] }> } {
+  const systemParts: string[] = []
+  const out: Array<{ role: string, content: string | AnthropicContentBlock[] }> = []
+
+  for (const message of messages) {
+    if (message.role === 'system') {
+      if (message.content) systemParts.push(message.content)
+      continue
+    }
+    if (message.role === 'tool') {
+      // A tool result must arrive as a user turn holding tool_result blocks.
+      // Consecutive tool results merge into one user turn, which is exactly
+      // how the OpenAI loop emits them (one per executed call).
+      const block: AnthropicContentBlock = {
+        type: 'tool_result',
+        tool_use_id: message.tool_call_id || '',
+        content: message.content || '',
+      }
+      const previous = out[out.length - 1]
+      if (previous && previous.role === 'user' && Array.isArray(previous.content)) {
+        previous.content.push(block)
+      } else {
+        out.push({ role: 'user', content: [block] })
+      }
+      continue
+    }
+    if (message.role === 'assistant' && message.tool_calls?.length) {
+      const blocks: AnthropicContentBlock[] = []
+      if (message.content) blocks.push({ type: 'text', text: message.content })
+      for (const call of message.tool_calls) {
+        blocks.push({
+          type: 'tool_use',
+          id: call.id,
+          name: call.function.name,
+          input: safeJson(call.function.arguments),
+        })
+      }
+      out.push({ role: 'assistant', content: blocks })
+      continue
+    }
+    const role = message.role === 'assistant' ? 'assistant' : 'user'
+    if (message.content) out.push({ role, content: message.content })
+  }
+  return { system: systemParts.join('\n\n'), messages: out }
+}
+
+async function callAnthropicModel(
+  model: string,
+  messages: ChatMessage[],
+  tools: McpTool[],
+  onDelta: (text: string) => Promise<void>,
+  baseUrlOverride?: string,
+): Promise<ModelTurnResult> {
+  const { system, messages: anthropicMessages } = toAnthropicMessages(messages)
+  const body: Record<string, unknown> = {
+    model,
+    max_tokens: anthropicMaxTokens(),
+    stream: true,
+    messages: anthropicMessages,
+  }
+  if (system) body.system = system
+  if (tools.length) {
+    body.tools = tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description || '',
+      input_schema: tool.inputSchema || { type: 'object' },
+    }))
+  }
+
+  const response = await fetch(anthropicEndpoint(baseUrlOverride), {
+    method: 'POST',
+    headers: {
+      'x-api-key': modelApiKey,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    const detail: any = await response.json().catch(() => null)
+    const message = detail?.error?.message || detail?.message || `Model provider returned ${response.status}`
+    if (response.status === 401 || response.status === 403) {
+      throw new ApiError(response.status, message, 'MODEL_AUTH_FAILED')
+    }
+    throw new ApiError(response.status, message, 'MODEL_REQUEST_FAILED')
+  }
+
+  let content = ''
+  // tool_use blocks stream their arguments as input_json_delta fragments, so
+  // each accumulator holds the growing JSON string until its block stops.
+  const calls = new Map<number, ToolCallAccumulator>()
+  let activeToolIndex = -1
+  for await (const data of sseDataLines(response)) {
+    if (!data) continue
+    let chunk: any
+    try {
+      chunk = JSON.parse(data)
+    } catch {
+      continue
+    }
+    if (chunk?.type === 'content_block_start') {
+      const block = chunk?.content_block
+      if (block?.type === 'tool_use') {
+        activeToolIndex = Number(chunk.index ?? 0)
+        calls.set(activeToolIndex, {
+          id: block.id || `tool_${activeToolIndex}`,
+          name: block.name || '',
+          arguments: '',
+        })
+      }
+      continue
+    }
+    if (chunk?.type === 'content_block_delta') {
+      const delta = chunk?.delta
+      if (delta?.type === 'text_delta' && delta.text) {
+        content += delta.text
+        await onDelta(delta.text)
+      } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
+        const current = calls.get(activeToolIndex)
+        if (current) current.arguments += delta.partial_json
+      }
+      continue
+    }
+    if (chunk?.type === 'content_block_stop') {
+      activeToolIndex = -1
+      continue
+    }
+    if (chunk?.type === 'message_stop') break
+  }
+  return {
+    content,
+    toolCalls: [...calls.values()].filter((call) => call.name),
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MCP tools (Streamable HTTP)
 // ---------------------------------------------------------------------------
 
 class McpClient {
   private nextId = 1
   private sessionId = ''
-  private tools: McpTool[] = []
+  private availableTools: McpTool[] = []
 
   private constructor(private readonly url: string, private readonly token: string) {}
 
@@ -309,8 +541,8 @@ class McpClient {
       if (!initialized) return null
       await client.notify('notifications/initialized')
       const listed: any = await client.rpc('tools/list', {})
-      client.tools = Array.isArray(listed?.tools) ? listed.tools : []
-      return client.tools.length ? client : null
+      client.availableTools = Array.isArray(listed?.tools) ? listed.tools : []
+      return client.availableTools.length ? client : null
     } catch (error) {
       console.error('MCP connect failed:', error instanceof Error ? error.message : error)
       return null
@@ -318,7 +550,7 @@ class McpClient {
   }
 
   get tools(): McpTool[] {
-    return this.tools
+    return this.availableTools
   }
 
   async call(name: string, args: Record<string, unknown>): Promise<string> {
@@ -404,44 +636,71 @@ async function connectMcp(agentId: string): Promise<McpClient | null> {
 // ---------------------------------------------------------------------------
 
 async function drainInbox(): Promise<void> {
-  for (let handled = 0; handled < MAX_TURNS_PER_INVOCATION; handled++) {
-    let items: InboxItem[]
-    try {
-      const response = await agentFetch(
-        `/inbox?wait=${INBOX_WAIT_SECONDS}&limit=${INBOX_BATCH}`,
-        { method: 'GET' },
-      )
-      const payload: any = await response.json()
-      items = Array.isArray(payload?.data) ? payload.data : []
-    } catch (error) {
-      // 401/403 (revoked token) must not spin the cron loop
-      console.error('inbox poll failed:', error instanceof Error ? error.message : error)
-      return
+  if (draining) {
+    console.log('drain already active; skipping overlapping invocation')
+    return
+  }
+  draining = true
+  try {
+    for (let handled = 0; handled < MAX_TURNS_PER_INVOCATION; handled++) {
+      let items: InboxItem[]
+      try {
+        // The backend may hold the request for the full long-poll wait; the
+        // +15s margin covers transport overhead. A timeout is treated like any
+        // other poll failure: log it and stop instead of spinning.
+        const response = await withTimeout(
+          agentFetch(
+            `/inbox?wait=${INBOX_WAIT_SECONDS}&limit=${INBOX_BATCH}`,
+            { method: 'GET' },
+          ),
+          (INBOX_WAIT_SECONDS + 15) * 1000,
+          'inbox poll timed out',
+        )
+        const payload: any = await response.json()
+        items = Array.isArray(payload?.data) ? payload.data : []
+      } catch (error) {
+        // 401/403 (revoked token) must not spin the cron loop
+        console.error('inbox poll failed:', error instanceof Error ? error.message : error)
+        return
+      }
+      if (!items.length) return
+      for (const item of items) {
+        if (activeTurns >= MAX_CONCURRENT_TURNS) {
+          console.log('turn concurrency cap reached; leaving rest for the next invocation')
+          break
+        }
+        await executeInboxItem(item)
+      }
     }
-    if (!items.length) return
-    for (const item of items) {
-      await executeInboxItem(item)
-    }
+  } finally {
+    draining = false
   }
 }
 
 async function executeInboxItem(item: InboxItem): Promise<void> {
-  const claimToken = crypto.randomUUID()
-  let claim: Claim
+  // Counted for the concurrency cap from claim through report so overlapping
+  // invocations cannot push the isolate past MAX_CONCURRENT_TURNS.
+  activeTurns++
   try {
-    const response = await agentFetch(`/agents/${item.agent_id}/inbox/${item.message.id}/claim`, {
-      method: 'POST',
-      headers: { 'X-Claim-Token': claimToken },
-      body: '{}',
-    })
-    const payload: any = await response.json()
-    claim = payload?.data
-  } catch (error) {
-    console.error(`claim failed for message ${item.message.id}:`, error instanceof Error ? error.message : error)
-    return
+    const claimToken = crypto.randomUUID()
+    let claim: Claim
+    try {
+      const response = await agentFetch(`/agents/${item.agent_id}/inbox/${item.message.id}/claim`, {
+        method: 'POST',
+        headers: { 'X-Claim-Token': claimToken },
+        body: '{}',
+      })
+      const payload: any = await response.json()
+      claim = payload?.data
+    } catch (error) {
+      console.error(`claim failed for message ${item.message.id}:`, error instanceof Error ? error.message : error)
+      return
+    }
+    if (!claim?.run_id) return
+    await runTurn(item.agent_id, claim)
+  } finally {
+    activeTurns--
   }
-  if (!claim?.run_id) return
-  await runTurn(item.agent_id, claim)
 }
 
 async function runTurn(agentId: string, claim: Claim): Promise<void> {
@@ -477,6 +736,7 @@ async function runTurn(agentId: string, claim: Claim): Promise<void> {
 async function executeTurn(agentId: string, claim: Claim, events: EventStream): Promise<string> {
   const model = claim.model
   if (!model) throw new ApiError(0, 'Agent config has no model', 'CONFIG_INVALID')
+  const protocol = resolveModelProtocol(claim)
   const mcp = await connectMcp(agentId)
   const tools = mcp?.tools || []
 
@@ -494,7 +754,7 @@ async function executeTurn(agentId: string, claim: Claim, events: EventStream): 
     const result = await callModel(model, messages, tools, async (text) => {
       events.push('delta', text)
       await events.flushIfLarge()
-    })
+    }, claim.model_base_url, protocol)
     if (result.content) finalContent = result.content
 
     if (!result.toolCalls.length) break
@@ -603,16 +863,27 @@ function applyEnv(env: Env) {
   modelApiKey = env.MODEL_API_KEY || ''
   modelBase = env.MODEL_BASE_URL || ''
   maxStepsEnv = env.MAX_STEPS || ''
+  modelMaxTokens = env.MODEL_MAX_TOKENS || ''
 }
 
 function isConfigured(): boolean {
-  return Boolean(workerToken) && Boolean(apiUrl)
+  return Boolean(workerToken) && Boolean(apiUrl) && !isPlaceholder(workerToken)
+}
+
+// The wizard pre-fills secrets from .dev.vars.example, so a user who clicks
+// through without editing deploys the placeholder verbatim. That token passes a
+// mere emptiness check and then fails every call with an opaque 401, which reads
+// like "the Worker is broken" instead of "the secret was never filled in".
+function isPlaceholder(value: string): boolean {
+  const token = String(value || '').trim()
+  if (!token) return true
+  return /^replace_with/i.test(token) || /\breplace_me\b/i.test(token)
 }
 export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     applyEnv(env)
     if (!isConfigured()) {
-      console.error('Worker is not configured: set URL_BACKEND (var) and WORKER_TOKEN (secret)')
+      console.error('Worker is not configured: set URL_BACKEND (var) and a real WORKER_TOKEN secret (not the wizard placeholder)')
       return
     }
     ctx.waitUntil((async () => {
@@ -635,7 +906,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     applyEnv(env)
     if (!isConfigured()) {
-      return Response.json({ ok: false, error: 'Worker is not configured: set URL_BACKEND (var) and WORKER_TOKEN (secret)' }, { status: 500 })
+      return Response.json({ ok: false, error: 'Worker is not configured: set URL_BACKEND (var) and a real WORKER_TOKEN secret (not the wizard placeholder)' }, { status: 500 })
     }
     if (request.method === 'POST') {
       ctx.waitUntil(drainInbox())
@@ -647,6 +918,7 @@ export default {
       version: WORKER_VERSION,
       environment: String(env.ENVIRONMENT || '').toLowerCase() === 'development' ? 'development' : 'production',
       backend: apiUrl,
+      token_configured: !isPlaceholder(workerToken),
     })
   },
 }

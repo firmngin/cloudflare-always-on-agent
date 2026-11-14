@@ -2,11 +2,20 @@ name = "firmngin-data-agent"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
 
-# Runs the scheduled turn once an hour for every enabled agent of the
-# workspace. Edit here or in the Cloudflare dashboard (Worker -> Triggers ->
-# Cron) after deploying.
+# This Worker is driven by Cloudflare (cron) and long-polling, not by inbound
+# HTTP. Leaving the public workers.dev hostname and preview URLs enabled would
+# publish an unauthenticated endpoint that can drain the inbox, so both are off.
+workers_dev = false
+preview_urls = false
+
+# Runs once a minute. This Worker is long-poll driven: the cron tick is what
+# wakes it to heartbeat and pick up queued chat turns, because the backend never
+# calls into the Worker and workers.dev is disabled below. An hourly tick made
+# a freshly deployed Worker look dead for up to an hour. Scheduled agent runs
+# stay hourly regardless: their idempotency key is hour-bucketed, so extra ticks
+# reuse the same run instead of creating duplicates.
 [triggers]
-crons = ["0 * * * *"]
+crons = ["* * * * *"]
 
 [vars]
 # Production API base URL. This is the only backend committed to the repo.
@@ -17,9 +26,17 @@ crons = ["0 * * * *"]
 # Nothing about a private tunnel belongs in this file.
 URL_BACKEND = "https://api.firmngin.dev"
 
-# Any OpenAI-compatible chat endpoint works (OpenRouter, OpenAI, Groq, ...).
+# The chat endpoint + key for agents whose provider is OpenRouter (the
+# dashboard default) or OpenAI Compatible. For "Claude Compatible" agents the
+# same two vars are reused, but MODEL_BASE_URL must point at the Anthropic API
+# root (https://api.anthropic.com) and MODEL_API_KEY at an Anthropic key: the
+# Worker detects the provider from the agent and speaks the Messages API.
 # The model id from each agent's config is passed through unchanged.
 MODEL_BASE_URL = "https://openrouter.ai/api/v1"
+
+# Output token cap required by the Anthropic Messages API. Raise it if your
+# agents produce long answers (Claude 3.5+ accepts more).
+MODEL_MAX_TOKENS = "8192"
 
 # Safety bound for tool-calling steps inside one turn.
 MAX_STEPS = "8"

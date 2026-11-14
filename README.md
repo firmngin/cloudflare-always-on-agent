@@ -25,8 +25,15 @@ click **Deploy to Cloudflare**. The wizard asks for:
 
 There is no agent id and no agent form: the Worker is workspace-level.
 
-The Worker deploys with an hourly cron trigger. Change the schedule in the
+The Worker deploys with a once-a-minute cron trigger. Inbox pickup is
+adaptive: while the workspace is active the long-poll returns the moment a
+turn is queued, and while it is idle the backend answers instantly so the
+cron tick (within a minute) stays the fallback. Change the schedule in the
 Cloudflare dashboard (**Workers → your worker → Triggers → Cron**).
+
+`workers_dev` and `preview_urls` are disabled: the Worker exposes an
+unauthenticated `POST /` that drains the inbox, so it must not be reachable on a
+public hostname.
 
 ## Manual deploy
 
@@ -70,11 +77,16 @@ which backend a deployment is actually talking to.
 
 1. Sends a heartbeat (drives the "Worker connected" status in the dashboard).
 2. Lists the workspace's enabled agents and queues one scheduled turn per
-   agent (hour-bucket idempotency key, so a retry within the same hour does
-   not duplicate a run).
+   agent. The idempotency key is hour-bucketed, so the per-minute tick reuses
+   the same run within an hour instead of creating duplicates.
 3. Drains the merged inbox: claims each queued turn (interactive chat replies
-   and scheduled turns run through the same loop), executes it with tool
-   access, streams deltas/tool events, and reports the final answer.
+   and scheduled runs go through the same loop), executes it with tool access,
+   streams deltas/tool events, and reports the final answer.
+4. Keeps long-polling the inbox: an active workspace's request is held until
+   something is enqueued (or up to 25 seconds), an idle one is answered
+   instantly, so a chat reply usually starts within seconds of being sent
+   rather than at the next minute boundary; while the workspace is idle the
+   once-a-minute cron tick remains the fallback.
 
 `POST`ing to the Worker URL drains the inbox immediately — handy for testing
 right after deploying. `GET`ing it sends a heartbeat and reports the version.
@@ -90,6 +102,7 @@ opted into on the agent in the Firmngin dashboard.
 
 - A turn is abandoned (reported `failed`) after 4 minutes — Firmngin's own
   deadline is 5.
-- At most 10 turns are claimed per invocation; the rest wait for the next tick.
+- At most 10 turns are claimed per invocation and at most 2 run at once; the
+  rest wait for the next tick.
 - Model calls use streaming with `tools` in OpenAI format; each agent's model
   id is passed to the provider unchanged.
