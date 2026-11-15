@@ -14,17 +14,28 @@
  * Set AGENT_ENGINE="builtin" to fall back to the previous hand-rolled loop
  * (kept intact below as executeTurnBuiltin).
  *
- * Inbox pickup is adaptive: the backend answers the long-poll instantly while
- * the workspace is idle (the once-a-minute cron tick stays the fallback) and
- * holds an active workspace's request until a turn is queued, so replies
- * usually start within seconds. Overlapping invocations are guarded on the
- * Worker side — an in-flight drain is never started twice and at most two
- * turns run at once — while the backend's CAS claim stays the authority
- * against double execution.
+ * Inbox pickup is adaptive and sustained inside one invocation: the backend
+ * answers the long-poll instantly while the workspace is idle and holds an
+ * active workspace's request until a turn is queued. Instead of quitting after
+ * a single empty poll — which leaves a window with nobody listening until the
+ * next cron tick — the drain keeps polling for DRAIN_BUDGET_MS, so a long-poll
+ * waiter is registered almost continuously and a queued message is claimed
+ * within seconds. Overlapping invocations are guarded on the Worker side — an
+ * in-flight drain is never started twice and at most two turns run at once —
+ * while the backend's CAS claim stays the authority against double execution.
  *
  * Firmngin never sees the model provider key and never executes the agent.
  * Agents are created in the Firmngin dashboard — the Worker picks them up
  * automatically; nothing here is per-agent and no redeploy is needed.
+ *
+ * Durable Objects (plan v1.2 §2.1, §6.1, §9.3): one named SQLite object per
+ * agent (`w:{workspace_id}:a:{agent_id}`, see src/durable/agent.ts) owns that
+ * agent's recurring schedules through the Cloudflare Agents Lifecycle +
+ * Scheduler. The object only turns a fired schedule into an idempotent enqueue
+ * call to Firmngin; chat long-poll and model inference stay here on the Worker.
+ * `AGENT_DO_SYNC=true` enables the sync, and when it is on the once-a-minute
+ * cron hour-bucket scheduler is skipped so one logical task never has two
+ * schedulers.
  *
  * Deploy: the Firmngin dashboard "Deploy to Cloudflare" button (this repo), or
  * `npx wrangler deploy` after filling in wrangler.toml and the two secrets:
@@ -47,6 +58,11 @@ import {
 } from './pi/stream-fn'
 import { safeJson, summarize, type McpTool } from './pi/tools'
 import { executeTurnPi, type PiEngineDeps } from './pi/engine'
+import { isPlaceholderToken, resolveBackendUrl, trimSlash } from './runtime/endpoints'
+import { durableObjectName, type DesiredSchedule, type WorkspaceAgent as WorkspaceAgentType } from './durable/agent'
+
+// Durable Object class: one named SQLite object per agent (plan v1.2 §2.1).
+export { WorkspaceAgent } from './durable/agent'
 
 export interface Env {
   URL_BACKEND: string
@@ -65,9 +81,17 @@ export interface Env {
    * runs the previous hand-rolled loop. Any other value falls back to "pi".
    */
   AGENT_ENGINE?: string
+  /**
+   * Per-agent Durable Object runtime (Lifecycle + Scheduler). Off by default so
+   * a deployment whose schedules still use the cron hour-bucket keeps working;
+   * the dashboard/template turns it on once `agent_schedules` sync is live.
+   */
+  AGENT_DO_SYNC?: string
+  /** Named SQLite Durable Object per agent (`WorkspaceAgent`). */
+  WORKSPACE_AGENT?: DurableObjectNamespace<WorkspaceAgentType>
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.0'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.3'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -79,6 +103,19 @@ const TURN_TIMEOUT_MS = 4 * 60_000
 const INBOX_WAIT_SECONDS = 25
 const INBOX_BATCH = 5
 const MAX_TURNS_PER_INVOCATION = 10
+// One invocation keeps polling until this budget is spent instead of quitting
+// after a single empty poll. The backend only holds a request while a waiter is
+// registered, so a Worker that exits after one 25s poll leaves a ~35s window
+// with nobody listening: a message sent then waits for the next cron tick, which
+// is what made chat feel slow. Staying inside the invocation covers that window
+// and brings pickup down to seconds. The cron wall-clock limit is 15 minutes,
+// and CPU spent waiting on the long-poll is effectively zero, so this is cheap.
+const DRAIN_BUDGET_MS = 50_000
+// An idle workspace returns the empty page immediately (no waiter held). Back
+// off briefly so the remaining budget becomes a slow poll, not a request spin.
+const IDLE_POLL_BACKOFF_MS = 1_500
+// A poll that answered faster than this did not hold: it is the idle signal.
+const HELD_POLL_THRESHOLD_MS = 1_000
 // Bounds cost when cron invocations overlap; the BE CAS claim still prevents
 // double execution, this only caps spend.
 const MAX_CONCURRENT_TURNS = 2
@@ -93,6 +130,11 @@ let workerToken = ''
 let maxStepsEnv = ''
 // "pi" (default) | "builtin": which turn engine runs claimed turns.
 let agentEngine: 'pi' | 'builtin' = 'pi'
+// Per-agent Durable Object sync (schedules). Off unless AGENT_DO_SYNC=true.
+let doSyncEnabled = false
+// The current invocation's env binding: the Durable Object namespace is only
+// reachable through it, so it is captured by applyEnv().
+let runtimeEnv: Env | null = null
 
 // Overlap guards shared by every invocation on this isolate: `draining`
 // serializes inbox drains so overlapping cron/manual triggers skip instead of
@@ -103,11 +145,13 @@ let activeTurns = 0
 interface WorkerAgent {
   id: string
   name: string
-  model: string
-  provider: string
-  model_base_url: string
-  enabled: boolean
-  config_revision: number
+  model?: string
+  provider?: string
+  model_base_url?: string
+  enabled?: boolean
+  config_revision?: number
+  /** Workspace the agent belongs to; used for the canonical DO name. */
+  workspace_id?: string
 }
 
 interface InboxItem {
@@ -118,11 +162,16 @@ interface InboxItem {
 }
 
 export interface Claim {
-  message: { id: number, content: string }
+  message: { id: number, content: string, created_at?: string }
   run_id: string
   conversation_id: string
   history: Array<{ role: string, content: string }>
+  // Snapshot accepted with the run; the Worker must not read the mutable
+  // agent config for these values. platform_prompt is the platform-level
+  // system prompt (capabilities, tool policy) owned by Firmngin; the owner's
+  // task_prompt is assembled below it.
   task_prompt: string
+  platform_prompt?: string
   model: string
   // Optional so older backends keep working; the Worker falls back to its
   // MODEL_BASE_URL env when they are absent.
@@ -136,8 +185,6 @@ export interface Claim {
   // on demand. Absent (older backends) -> the feature is inert.
   skills?: Array<{ name?: string, description?: string, content?: string, markdown?: string }>
 }
-
-const trimSlash = (value: string) => String(value || '').replace(/\/+$/, '')
 
 function runtimeUrl(path: string): string {
   return `${trimSlash(apiUrl)}/api/v1/agent-runtime/worker${path}`
@@ -350,8 +397,15 @@ async function drainInbox(): Promise<void> {
     return
   }
   draining = true
+  const startedAt = Date.now()
+  let handled = 0
   try {
-    for (let handled = 0; handled < MAX_TURNS_PER_INVOCATION; handled++) {
+    // Sustained drain: poll until the invocation budget is spent. Every extra
+    // poll keeps a long-poll waiter registered with the backend, and a queued
+    // message wakes it immediately — the pickup latency the dashboard shows as
+    // "waiting for the Worker".
+    while (handled < MAX_TURNS_PER_INVOCATION && Date.now() - startedAt < DRAIN_BUDGET_MS) {
+      const pollStartedAt = Date.now()
       let items: InboxItem[]
       try {
         // The backend may hold the request for the full long-poll wait; the
@@ -384,18 +438,30 @@ async function drainInbox(): Promise<void> {
         console.error('inbox poll failed:', error instanceof Error ? error.message : error)
         return
       }
-      if (!items.length) return
+      if (!items.length) {
+        // Idle workspace: the answer came back instantly, so no waiter was
+        // held. Pause briefly, then poll again while budget remains.
+        if (Date.now() - pollStartedAt < HELD_POLL_THRESHOLD_MS) {
+          await sleep(IDLE_POLL_BACKOFF_MS)
+        }
+        continue
+      }
       for (const item of items) {
         if (activeTurns >= MAX_CONCURRENT_TURNS) {
           console.log('turn concurrency cap reached; leaving rest for the next invocation')
-          break
+          return
         }
         await executeInboxItem(item)
+        handled++
       }
     }
   } finally {
     draining = false
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 async function executeInboxItem(item: InboxItem): Promise<void> {
@@ -418,6 +484,13 @@ async function executeInboxItem(item: InboxItem): Promise<void> {
       return
     }
     if (!claim?.run_id) return
+    // Queue wait is the part of "chat is slow" that the Worker controls (the
+    // rest is model latency). Logging it makes a pickup regression visible in
+    // `wrangler tail` instead of only in the dashboard feeling.
+    const queuedAt = Date.parse(String(claim.message?.created_at || ''))
+    if (Number.isFinite(queuedAt)) {
+      console.log(`run ${claim.run_id} claimed ${Date.now() - queuedAt}ms after it was queued`)
+    }
     await runTurn(item.agent_id, claim)
   } finally {
     activeTurns--
@@ -472,8 +545,16 @@ async function executeTurnBuiltin(agentId: string, claim: Claim, events: EventSt
   const mcp = await connectMcp(agentId)
   const tools = mcp?.tools || []
 
+  // Two-level system prompt: platform capabilities first, owner instruction
+  // last. Without platform_prompt (older backends) this is unchanged.
+  const platformText = String(claim.platform_prompt || '').trim()
+  const taskText = String(claim.task_prompt || '').trim()
+  const systemContent = platformText && taskText
+    ? `${platformText}\n\n# Owner instructions\n\n${taskText}`
+    : (taskText || platformText)
+
   const messages: ChatMessage[] = [
-    { role: 'system', content: claim.task_prompt },
+    { role: 'system', content: systemContent },
     ...(claim.history || [])
       .filter((item) => item.role === 'user' || item.role === 'assistant')
       .map((item) => ({ role: item.role as Role, content: item.content || '' })),
@@ -556,7 +637,9 @@ async function heartbeat(): Promise<void> {
 }
 
 // Hour-bucket idempotency key per agent: a retried cron within the same hour
-// returns the existing queued turn instead of duplicating it.
+// returns the existing queued turn instead of duplicating it. Legacy fallback
+// only: an agent whose schedules are owned by its Durable Object must NOT also
+// be enqueued from cron (two schedulers for one logical task).
 async function queueScheduledRuns(agents: WorkerAgent[]): Promise<void> {
   const hourBucket = new Date().toISOString().slice(0, 13)
   for (const agent of agents) {
@@ -571,35 +654,147 @@ async function queueScheduledRuns(agents: WorkerAgent[]): Promise<void> {
   }
 }
 
-function resolveBackendUrl(env: Env): string {
-  const isDev = String(env.ENVIRONMENT || '').trim().toLowerCase() === 'development'
-  const devUrl = String(env.URL_BACKEND_DEV || '').trim()
-  // The dev override only applies when the deployment is explicitly marked as
-  // development, so a stray URL_BACKEND_DEV on production cannot redirect it.
-  if (isDev && devUrl) return trimSlash(devUrl)
-  return trimSlash(String(env.URL_BACKEND || '').trim())
+/** Agent roster for this workspace Worker token; never throws. */
+async function listWorkerAgents(): Promise<WorkerAgent[]> {
+  // Preferred: the scoped deployment config. It carries the workspace id the
+  // canonical Durable Object name needs and returns only this token's workspace.
+  try {
+    const response = await agentFetch('/deployment/config', { method: 'GET' })
+    if (response.ok) {
+      const payload: any = await response.json()
+      const data = payload?.data || {}
+      const workspaceId = String(data?.workspace_id || '')
+      const agents = Array.isArray(data?.agents) ? data.agents : []
+      return agents.map((agent: any) => ({ ...agent, workspace_id: workspaceId }))
+    }
+    if (response.status !== 404) {
+      console.error('deployment config failed:', response.status)
+    }
+  } catch (error) {
+    console.error('deployment config failed:', error instanceof Error ? error.message : error)
+  }
+  // Fallback for a backend that predates the config endpoint.
+  try {
+    const response = await agentFetch('/agents', { method: 'GET' })
+    const payload: any = await response.json()
+    return Array.isArray(payload?.data) ? payload.data : []
+  } catch (error) {
+    console.error('listing agents failed:', error instanceof Error ? error.message : error)
+    return []
+  }
+}
+
+/**
+ * Outbound pairing: promotes the workspace deployment pending→connected and
+ * refreshes the Worker credential row. Idempotent and replay-safe, so calling it
+ * every invocation is cheap; a nonce is sent for correlation only, never as
+ * authentication.
+ */
+async function handshake(): Promise<void> {
+  try {
+    const response = await agentFetch('/handshake', {
+      method: 'POST',
+      body: JSON.stringify({ runtime_version: WORKER_VERSION, nonce: crypto.randomUUID() }),
+    })
+    if (!response.ok && response.status !== 404) {
+      console.error('handshake returned non-OK:', response.status)
+    }
+  } catch (error) {
+    console.error('handshake failed:', error instanceof Error ? error.message : error)
+  }
+}
+
+/**
+ * Desired schedules for one agent, as owned by the backend (`agent_schedules`).
+ * An absent endpoint (older backend) is a no-op, not an error: DO sync turns on
+ * through AGENT_DO_SYNC only after this contract ships.
+ */
+async function fetchDesiredSchedules(agentId: string): Promise<DesiredSchedule[] | null> {
+  try {
+    const response = await agentFetch(`/agents/${agentId}/schedules`, { method: 'GET' })
+    if (!response.ok) {
+      if (response.status !== 404) {
+        console.error('schedule sync fetch failed:', response.status)
+      }
+      return null
+    }
+    const payload: any = await response.json()
+    return Array.isArray(payload?.data) ? payload.data : []
+  } catch (error) {
+    console.error('schedule sync fetch failed:', error instanceof Error ? error.message : error)
+    return null
+  }
+}
+
+/**
+ * Pushes each agent's desired schedules into its named Durable Object
+ * (`w:{workspace}:a:{agent}`). The object is created lazily here — never at
+ * workspace/agent creation — and the sync is idempotent, so a repeated cron
+ * tick changes nothing.
+ *
+ * Returns the agent ids whose scheduling is now owned by a Durable Object (at
+ * least one `agent_schedules` row, enabled or not). Those agents must NOT also
+ * be enqueued by the legacy hour-bucket cron; agents without any schedule keep
+ * the legacy default so a flag flip does not silently stop their runs.
+ */
+async function syncAgentDurableObjects(agents: WorkerAgent[]): Promise<Set<string>> {
+  const owned = new Set<string>()
+  const namespace = runtimeEnv?.WORKSPACE_AGENT
+  if (!namespace) {
+    console.error('AGENT_DO_SYNC is enabled but the WORKSPACE_AGENT binding is missing; leaving schedules on the cron fallback')
+    return owned
+  }
+  for (const agent of agents) {
+    const workspaceId = String(agent.workspace_id || '').trim()
+    if (!workspaceId) {
+      // Older backends do not return the workspace id; the canonical object
+      // name cannot be derived without it, so skip instead of inventing one.
+      continue
+    }
+    try {
+      const desired = await fetchDesiredSchedules(agent.id)
+      if (!desired) continue
+      const stub = namespace.getByName(durableObjectName(workspaceId, agent.id))
+      const result = await stub.syncSchedules(desired, Number(agent.config_revision || 0))
+      if (desired.length) owned.add(agent.id)
+      // Report provisioning/sync state so the dashboard can show the binding
+      // without querying Cloudflare. Best-effort: a failure here never blocks
+      // the schedule sync that already succeeded.
+      try {
+        await agentFetch(`/agents/${agent.id}/runtime-binding`, {
+          method: 'POST',
+          body: JSON.stringify({
+            do_name: durableObjectName(workspaceId, agent.id),
+            applied_config_version: result.applied_config_version,
+          }),
+        })
+      } catch (error) {
+        console.error(`runtime binding report failed for agent ${agent.id}:`, error instanceof Error ? error.message : error)
+      }
+      if (result.created || result.cancelled) {
+        console.log(
+          `durable object synced: agent=${agent.id} created=${result.created} cancelled=${result.cancelled} applied=${result.applied_version}`,
+        )
+      }
+    } catch (error) {
+      console.error(`durable object sync failed for agent ${agent.id}:`, error instanceof Error ? error.message : error)
+    }
+  }
+  return owned
 }
 
 function applyEnv(env: Env) {
+  runtimeEnv = env
   apiUrl = resolveBackendUrl(env)
   workerToken = env.WORKER_TOKEN || ''
   maxStepsEnv = env.MAX_STEPS || ''
   applyModelRuntimeEnv(env)
   agentEngine = String(env.AGENT_ENGINE || '').trim().toLowerCase() === 'builtin' ? 'builtin' : 'pi'
+  doSyncEnabled = String(env.AGENT_DO_SYNC || '').trim().toLowerCase() === 'true'
 }
 
 function isConfigured(): boolean {
-  return Boolean(workerToken) && Boolean(apiUrl) && !isPlaceholder(workerToken)
-}
-
-// The wizard pre-fills secrets from .dev.vars.example, so a user who clicks
-// through without editing deploys the placeholder verbatim. That token passes a
-// mere emptiness check and then fails every call with an opaque 401, which reads
-// like "the Worker is broken" instead of "the secret was never filled in".
-function isPlaceholder(value: string): boolean {
-  const token = String(value || '').trim()
-  if (!token) return true
-  return /^replace_with/i.test(token) || /\breplace_me\b/i.test(token)
+  return Boolean(workerToken) && Boolean(apiUrl) && !isPlaceholderToken(workerToken)
 }
 export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -609,17 +804,27 @@ export default {
       return
     }
     ctx.waitUntil((async () => {
-      await heartbeat()
-      let agents: WorkerAgent[] = []
-      try {
-        const response = await agentFetch('/agents', { method: 'GET' })
-        const payload: any = await response.json()
-        agents = Array.isArray(payload?.data) ? payload.data : []
-      } catch (error) {
-        console.error('listing agents failed:', error instanceof Error ? error.message : error)
-      }
-      await queueScheduledRuns(agents)
-      await drainInbox()
+      // Start polling before anything else: pickup latency is the part of a
+      // chat turn the Worker owns, so it must not queue behind the heartbeat
+      // and agent-listing round trips.
+      const drain = drainInbox()
+      await Promise.all([
+        heartbeat(),
+        handshake(),
+        (async () => {
+          const agents = await listWorkerAgents()
+          if (doSyncEnabled) {
+            // DO-owned agents get their schedules from the object; agents with
+            // no schedule rows keep the legacy hourly default so flipping the
+            // flag never silently stops their runs.
+            const owned = await syncAgentDurableObjects(agents)
+            await queueScheduledRuns(agents.filter((agent) => !owned.has(agent.id)))
+            return
+          }
+          await queueScheduledRuns(agents)
+        })(),
+      ])
+      await drain
     })())
   },
 
@@ -640,7 +845,7 @@ export default {
       version: WORKER_VERSION,
       environment: String(env.ENVIRONMENT || '').toLowerCase() === 'development' ? 'development' : 'production',
       backend: apiUrl,
-      token_configured: !isPlaceholder(workerToken),
+      token_configured: !isPlaceholderToken(workerToken),
     })
   },
 }

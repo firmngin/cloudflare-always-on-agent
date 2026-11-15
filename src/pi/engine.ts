@@ -55,7 +55,16 @@ export async function executeTurnPi(agentId: string, claim: Claim, events: Event
 
   const skills = parseSkills(claim.skills)
   const skillsIndex = renderSkillsIndex(skills)
-  const systemPrompt = skillsIndex ? `${claim.task_prompt}\n\n${skillsIndex}` : claim.task_prompt
+  // Two-level system prompt: platform capabilities first, then the owner's
+  // instruction last (recency + ownership). Without platform_prompt (older
+  // backends) the assembly is unchanged: task_prompt + skills index.
+  const platformText = String(claim.platform_prompt || '').trim()
+  const taskText = String(claim.task_prompt || '').trim()
+  const sections: string[] = []
+  if (platformText) sections.push(platformText)
+  if (skillsIndex) sections.push(skillsIndex)
+  if (taskText) sections.push(platformText ? `# Owner instructions\n\n${taskText}` : taskText)
+  const systemPrompt = sections.join('\n\n')
   const tools: AgentTool[] = [...(mcp ? mapMcpTools(mcp) : []), ...createLoadSkillTool(skills)]
 
   // pi messages carry timestamps; history roles are filtered exactly like the

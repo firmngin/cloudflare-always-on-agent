@@ -1,6 +1,8 @@
 name = "firmngin-data-agent"
 main = "src/index.ts"
-compatibility_date = "2026-11-01"
+compatibility_date = "2026-11-15"
+# `agents` (Lifecycle + Scheduler) requires nodejs_compat.
+compatibility_flags = ["nodejs_compat"]
 
 # This Worker is driven by Cloudflare (cron) and long-polling, not by inbound
 # HTTP. Leaving the public workers.dev hostname and preview URLs enabled would
@@ -16,6 +18,17 @@ preview_urls = false
 # reuse the same run instead of creating duplicates.
 [triggers]
 crons = ["* * * * *"]
+
+# One named SQLite Durable Object per agent (plan v1.2 §2.1, §9.2). The object
+# owns the recurring schedules (Cloudflare Agents Scheduler) and the tiny
+# lifecycle state; chat long-poll and model inference stay on the Worker.
+[[durable_objects.bindings]]
+name = "WORKSPACE_AGENT"
+class_name = "WorkspaceAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkspaceAgent"]
 
 [vars]
 # Production API base URL. This is the only backend committed to the repo.
@@ -40,6 +53,11 @@ MODEL_MAX_TOKENS = "8192"
 
 # Safety bound for tool-calling steps inside one turn.
 MAX_STEPS = "8"
+
+# Per-agent Durable Object sync (Lifecycle + Scheduler). Leave "false" until the
+# backend exposes GET /agent-runtime/worker/agents/:id/schedules; while false the
+# once-a-minute cron hour-bucket remains the only scheduler (never both).
+AGENT_DO_SYNC = "false"
 
 # Secrets (set in the deploy wizard or `wrangler secret put`):
 #   WORKER_TOKEN  - the workspace Worker token (fng_aow_...) shown once in the

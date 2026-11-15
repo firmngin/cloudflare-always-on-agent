@@ -25,11 +25,14 @@ click **Deploy to Cloudflare**. The wizard asks for:
 
 There is no agent id and no agent form: the Worker is workspace-level.
 
-The Worker deploys with a once-a-minute cron trigger. Inbox pickup is
-adaptive: while the workspace is active the long-poll returns the moment a
-turn is queued, and while it is idle the backend answers instantly so the
-cron tick (within a minute) stays the fallback. Change the schedule in the
-Cloudflare dashboard (**Workers → your worker → Triggers → Cron**).
+The Worker deploys with a once-a-minute cron trigger. Cron is only the wake-up:
+`workers_dev`/preview URLs are disabled so Firmngin can never call into your
+Worker. To keep pickup fast, one cron invocation keeps long-polling the inbox
+for ~50 seconds instead of quitting after one empty poll, so a waiter is
+registered almost continuously and a sent message is claimed within seconds.
+While the workspace is idle the backend answers instantly and the Worker backs
+off briefly. Change the schedule in the Cloudflare dashboard (**Workers → your
+worker → Triggers → Cron**).
 
 `workers_dev` and `preview_urls` are disabled: the Worker exposes an
 unauthenticated `POST /` that drains the inbox, so it must not be reachable on a
@@ -76,20 +79,43 @@ which backend a deployment is actually talking to.
 ## What it does on each cron tick
 
 1. Sends a heartbeat (drives the "Worker connected" status in the dashboard).
-2. Lists the workspace's enabled agents and queues one scheduled turn per
-   agent. The idempotency key is hour-bucketed, so the per-minute tick reuses
-   the same run within an hour instead of creating duplicates.
+2. Lists the workspace's agents and syncs each agent's **Durable Object**
+   schedules (`AGENT_DO_SYNC=true`). An agent with at least one configured
+   schedule is owned by its object and is no longer queued from cron; an agent
+   with no schedule keeps the legacy hour-bucketed scheduled turn. While the
+   flag is `false` the legacy path applies to every agent. There is never more
+   than one scheduler per agent.
 3. Drains the merged inbox: claims each queued turn (interactive chat replies
    and scheduled runs go through the same loop), executes it with tool access,
    streams deltas/tool events, and reports the final answer.
-4. Keeps long-polling the inbox: an active workspace's request is held until
-   something is enqueued (or up to 25 seconds), an idle one is answered
-   instantly, so a chat reply usually starts within seconds of being sent
-   rather than at the next minute boundary; while the workspace is idle the
-   once-a-minute cron tick remains the fallback.
+4. Keeps long-polling the inbox until the invocation budget is spent: an active
+   workspace's request is held until something is enqueued (or up to 25
+   seconds), an idle one is answered instantly with a short backoff, so a chat
+   reply usually starts within seconds of being sent rather than at the next
+   minute boundary.
+
+## Scheduled runs (Durable Object per agent)
+Each agent gets one named SQLite Durable Object (`w:{workspace_id}:a:{agent_id}`)
+that owns its recurring schedules through the Cloudflare Agents Lifecycle +
+Scheduler (`src/durable/agent.ts`). The object never runs the model: a fired
+schedule becomes one idempotent enqueue call
+(`schedule_id` + `occurrence_at`) and Firmngin dedupes the occurrence, so a
+replayed callback cannot create a second run. The binding and migration are
+declared in `wrangler.toml`; `npm install` pulls `agents@0.33.0`
+(`nodejs_compat` is enabled for it). See
+`firmnginbe/docs/architecture/data-agent-durable-objects.md` for the contract.
 
 `POST`ing to the Worker URL drains the inbox immediately — handy for testing
 right after deploying. `GET`ing it sends a heartbeat and reports the version.
+
+## Pairing and runtime config
+
+On every cron invocation the Worker sends an outbound `POST /handshake`
+(`runtime_version` + a correlation nonce) so the workspace deployment moves
+`pending → connected` explicitly; repeating it is a no-op except for liveness.
+Its agent roster comes from `GET /deployment/config`, which is scoped to the
+Worker token and carries the workspace id needed for the Durable Object name.
+Both are worker-token routes — Firmngin still never calls into your Worker.
 
 ## Tools (MCP)
 
