@@ -63,3 +63,8 @@ AGENT_DO_SYNC = "false"
 #   WORKER_TOKEN  - the workspace Worker token (fng_aow_...) shown once in the
 #                   Firmngin dashboard. One deployment serves every agent.
 #   MODEL_API_KEY - your model provider key; never sent to Firmngin.
+
+# Persist correlated registration diagnostics in Cloudflare Workers Logs.
+[observability]
+enabled = true
+head_sampling_rate = 1

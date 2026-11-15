@@ -113,8 +113,10 @@ declared in `wrangler.toml`; `npm install` pulls `agents@0.33.0`
 (`nodejs_compat` is enabled for it). See
 `firmnginbe/docs/architecture/data-agent-durable-objects.md` for the contract.
 
-`POST`ing to the Worker URL drains the inbox immediately — handy for testing
-right after deploying. `GET`ing it sends a heartbeat and reports the version.
+The default deployment has no public probe URL: `workers_dev` and previews are
+disabled. Trace deployment through scheduled invocation logs below. The existing
+GET/POST handler is usable only if you already operate a deliberately configured
+private route; do not expose it publicly to troubleshoot pairing.
 
 ## Pairing and runtime config
 
@@ -153,3 +155,33 @@ loop (`executeTurnBuiltin`).
   rest wait for the next tick.
 - Model calls use streaming with `tools` in OpenAI format; each agent's model
   id is passed to the provider unchanged.
+
+## Trace a deployment that stays on “Waiting for the first heartbeat”
+
+Build success does not prove a cron invocation ran. This version enables
+Workers Logs and emits structured registration diagnostics. Open the Worker
+in Cloudflare → **Observability** and filter `event` or `invocation_id`.
+
+1. `runtime.invocation.start`: proves the scheduled handler ran; inspect
+   `worker_version`, `cron`, `scheduled_at`, `schedule_lag_ms`, `backend_origin`,
+   `backend_source`, `environment`, and configuration booleans. An ignored
+   development override is explicit in `dev_override_ignored`.
+2. `runtime.heartbeat.start` / `runtime.handshake.start`: use their `trace_id`
+   to find the same request in Firmngin backend logs (`X-Trace-Id`).
+3. `runtime.heartbeat.response`: inspect `status`, `error_code`, `cf_ray`,
+   `backend_request_id`, `duration_ms`, and `persistence_ack`. A 2xx response
+   without a valid heartbeat timestamp is not persistence confirmation.
+4. `runtime.*.failed`: timeout or transport/body failure is logged within 15s;
+   token values, headers, raw response bodies, and exception messages are not.
+5. A confirmed persistence acknowledgment with a waiting dashboard moves the
+   investigation to backend status selection, MQTT publish/subscription, and
+   frontend workspace state. Match the exact workspace and backend environment.
+
+No `runtime.invocation.start` for the deployed version means there is no code
+evidence that cron ran: inspect the active deployment, Cron Triggers, and
+Cloudflare invocation failures. A new/changed trigger can take up to 15 minutes
+to propagate; waiting beyond that is not explained by the one-minute schedule.
+The diagnostic trace adds no public endpoint; workers.dev remains disabled.
+
+Sources: [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/),
+[Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/).

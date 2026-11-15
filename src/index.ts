@@ -56,6 +56,7 @@ import {
 import { safeJson, summarize, type McpTool } from './pi/tools'
 import { executeTurnPi, type PiEngineDeps } from './pi/engine'
 import { inboxPollBudget, isPlaceholderToken, resolveBackendUrl, trimSlash, withRequestTimeout } from './runtime/endpoints'
+import { logRuntimeTrace, runtimeTrace, traceRegistration, type RuntimeTrace } from './runtime/diagnostics'
 import { durableObjectName, type DesiredSchedule, type WorkspaceAgent as WorkspaceAgentType } from './durable/agent'
 
 // Durable Object class: one named SQLite object per agent (plan v1.2 §2.1).
@@ -88,7 +89,7 @@ export interface Env {
   WORKSPACE_AGENT?: DurableObjectNamespace<WorkspaceAgentType>
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.4'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.5'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -601,20 +602,8 @@ async function finishRun(agentId: string, claim: Claim, report: {
   }
 }
 
-async function heartbeat(): Promise<void> {
-  try {
-    const response = await agentFetch('/heartbeat', {
-      method: 'POST',
-      body: JSON.stringify({ version: WORKER_VERSION }),
-    })
-    if (!response.ok) {
-      // Non-2xx heartbeat (e.g. revoked token → 401) must be visible; without
-      // this log the worker looks "connected" while silently degraded.
-      console.error('heartbeat returned non-OK:', response.status)
-    }
-  } catch (error) {
-    console.error('heartbeat failed:', error instanceof Error ? error.message : error)
-  }
+async function heartbeat(trace: RuntimeTrace): Promise<void> {
+  await traceRegistration(trace, apiUrl, workerToken, 'heartbeat', { version: WORKER_VERSION })
 }
 
 // Hour-bucket idempotency key per agent: a retried cron within the same hour
@@ -671,18 +660,10 @@ async function listWorkerAgents(): Promise<WorkerAgent[]> {
  * every invocation is cheap; a nonce is sent for correlation only, never as
  * authentication.
  */
-async function handshake(): Promise<void> {
-  try {
-    const response = await agentFetch('/handshake', {
-      method: 'POST',
-      body: JSON.stringify({ runtime_version: WORKER_VERSION, nonce: crypto.randomUUID() }),
-    })
-    if (!response.ok && response.status !== 404) {
-      console.error('handshake returned non-OK:', response.status)
-    }
-  } catch (error) {
-    console.error('handshake failed:', error instanceof Error ? error.message : error)
-  }
+async function handshake(trace: RuntimeTrace): Promise<void> {
+  await traceRegistration(trace, apiUrl, workerToken, 'handshake', {
+    runtime_version: WORKER_VERSION, nonce: crypto.randomUUID(),
+  })
 }
 
 /**
@@ -778,9 +759,15 @@ function isConfigured(): boolean {
   return Boolean(workerToken) && Boolean(apiUrl) && !isPlaceholderToken(workerToken)
 }
 export default {
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     applyEnv(env)
+    const trace = runtimeTrace(env, WORKER_VERSION, 'scheduled')
+    logRuntimeTrace(trace, 'runtime.invocation.start', {
+      cron: event.cron, scheduled_at: new Date(event.scheduledTime).toISOString(),
+      schedule_lag_ms: Date.now() - event.scheduledTime,
+    })
     if (!isConfigured()) {
+      logRuntimeTrace(trace, 'runtime.configuration.invalid', {}, true)
       console.error('Worker is not configured: set URL_BACKEND (var) and a real WORKER_TOKEN secret (not the wizard placeholder)')
       return
     }
@@ -790,8 +777,8 @@ export default {
       // and agent-listing round trips.
       const drain = drainInbox()
       await Promise.all([
-        heartbeat(),
-        handshake(),
+        heartbeat(trace),
+        handshake(trace),
         (async () => {
           const agents = await listWorkerAgents()
           if (doSyncEnabled) {
@@ -806,21 +793,28 @@ export default {
         })(),
       ])
       await drain
-    })())
+      logRuntimeTrace(trace, 'runtime.invocation.complete')
+    })().catch((error) => {
+      logRuntimeTrace(trace, 'runtime.invocation.failed', { failure: 'runtime_task_failure' }, true)
+      throw error
+    }))
   },
 
   // GET  / -> heartbeat probe (handy to verify the deploy works)
   // POST / -> drain the inbox now (manual "run pending turns" trigger)
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     applyEnv(env)
+    const trace = runtimeTrace(env, WORKER_VERSION, 'fetch')
+    logRuntimeTrace(trace, 'runtime.invocation.start', { method: request.method })
     if (!isConfigured()) {
+      logRuntimeTrace(trace, 'runtime.configuration.invalid', {}, true)
       return Response.json({ ok: false, error: 'Worker is not configured: set URL_BACKEND (var) and a real WORKER_TOKEN secret (not the wizard placeholder)' }, { status: 500 })
     }
     if (request.method === 'POST') {
       ctx.waitUntil(drainInbox())
       return Response.json({ ok: true, draining: true })
     }
-    ctx.waitUntil(heartbeat())
+    ctx.waitUntil(heartbeat(trace))
     return Response.json({
       ok: true,
       version: WORKER_VERSION,
