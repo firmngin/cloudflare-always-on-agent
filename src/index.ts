@@ -14,15 +14,12 @@
  * Set AGENT_ENGINE="builtin" to fall back to the previous hand-rolled loop
  * (kept intact below as executeTurnBuiltin).
  *
- * Inbox pickup is adaptive and sustained inside one invocation: the backend
- * answers the long-poll instantly while the workspace is idle and holds an
- * active workspace's request until a turn is queued. Instead of quitting after
- * a single empty poll — which leaves a window with nobody listening until the
- * next cron tick — the drain keeps polling for DRAIN_BUDGET_MS, so a long-poll
- * waiter is registered almost continuously and a queued message is claimed
- * within seconds. Overlapping invocations are guarded on the Worker side — an
- * in-flight drain is never started twice and at most two turns run at once —
- * while the backend's CAS claim stays the authority against double execution.
+ * Inbox pickup uses bounded long-polls, including for an idle workspace with
+ * enabled agents. Redis wake signals release the backend waiter as soon as a
+ * turn is queued. The drain keeps a waiter for up to DRAIN_BUDGET_MS; immediate
+ * empty responses (no agents or admission cap) end it until the next cron tick.
+ * The per-isolate overlap guard is best-effort; backend CAS claims remain the
+ * authority against duplicate execution across isolates.
  *
  * Firmngin never sees the model provider key and never executes the agent.
  * Agents are created in the Firmngin dashboard — the Worker picks them up
@@ -58,7 +55,7 @@ import {
 } from './pi/stream-fn'
 import { safeJson, summarize, type McpTool } from './pi/tools'
 import { executeTurnPi, type PiEngineDeps } from './pi/engine'
-import { isPlaceholderToken, resolveBackendUrl, trimSlash } from './runtime/endpoints'
+import { inboxPollBudget, isPlaceholderToken, resolveBackendUrl, trimSlash, withRequestTimeout } from './runtime/endpoints'
 import { durableObjectName, type DesiredSchedule, type WorkspaceAgent as WorkspaceAgentType } from './durable/agent'
 
 // Durable Object class: one named SQLite object per agent (plan v1.2 §2.1).
@@ -91,16 +88,13 @@ export interface Env {
   WORKSPACE_AGENT?: DurableObjectNamespace<WorkspaceAgentType>
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.3'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.4'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
 const TURN_TIMEOUT_MS = 4 * 60_000
-// Adaptive long-poll: an active workspace holds the request until something is
-// enqueued or this wait elapses, an idle one answers instantly and the
-// once-a-minute cron tick stays the fallback. An instant empty answer is the
-// normal idle response, not an error.
-const INBOX_WAIT_SECONDS = 25
+// Enabled workspaces hold the request until a turn arrives or its bounded
+// wait elapses. No-agent or over-cap responses may return immediately.
 const INBOX_BATCH = 5
 const MAX_TURNS_PER_INVOCATION = 10
 // One invocation keeps polling until this budget is spent instead of quitting
@@ -111,10 +105,7 @@ const MAX_TURNS_PER_INVOCATION = 10
 // and brings pickup down to seconds. The cron wall-clock limit is 15 minutes,
 // and CPU spent waiting on the long-poll is effectively zero, so this is cheap.
 const DRAIN_BUDGET_MS = 50_000
-// An idle workspace returns the empty page immediately (no waiter held). Back
-// off briefly so the remaining budget becomes a slow poll, not a request spin.
-const IDLE_POLL_BACKOFF_MS = 1_500
-// A poll that answered faster than this did not hold: it is the idle signal.
+// An immediate empty response means no waiter was held: let cron retry.
 const HELD_POLL_THRESHOLD_MS = 1_000
 // Bounds cost when cron invocations overlap; the BE CAS claim still prevents
 // double execution, this only caps spend.
@@ -405,26 +396,22 @@ async function drainInbox(): Promise<void> {
     // message wakes it immediately — the pickup latency the dashboard shows as
     // "waiting for the Worker".
     while (handled < MAX_TURNS_PER_INVOCATION && Date.now() - startedAt < DRAIN_BUDGET_MS) {
+      const budget = inboxPollBudget(DRAIN_BUDGET_MS - (Date.now() - startedAt))
+      if (!budget) return
       const pollStartedAt = Date.now()
       let items: InboxItem[]
       try {
-        // The backend may hold the request for the full long-poll wait; the
-        // +15s margin covers transport overhead. A timeout is treated like any
-        // other poll failure: log it and stop instead of spinning.
-        const response = await withTimeout(
-          agentFetch(
-            // wait must carry a unit: the backend validates ?wait as a
-            // duration (e.g. 25s). A unitless value is rejected as 400.
-            `/inbox?wait=${INBOX_WAIT_SECONDS}s&limit=${INBOX_BATCH}`,
-            { method: 'GET' },
-          ),
-          (INBOX_WAIT_SECONDS + 15) * 1000,
-          'inbox poll timed out',
-        )
-        const payload: any = await response.json()
+        // Keep cancellation active through response.json(), not just headers:
+        // a timeout must release the network request and the BE wake waiter.
+        const { response, payload } = await withRequestTimeout(async (signal) => {
+          const response = await agentFetch(
+            `/inbox?wait=${budget.waitSeconds}s&limit=${INBOX_BATCH}`,
+            { method: 'GET', signal },
+          )
+          const payload: any = await response.json()
+          return { response, payload }
+        }, budget.timeoutMs, 'inbox poll timed out')
         if (!response.ok) {
-          // A non-OK inbox response (400/401/403/5xx) means the empty result
-          // is unreliable — log it instead of silently treating it as "no work".
           console.error(
             'inbox poll returned non-OK:',
             response.status,
@@ -434,16 +421,14 @@ async function drainInbox(): Promise<void> {
         }
         items = Array.isArray(payload?.data) ? payload.data : []
       } catch (error) {
-        // 401/403 (revoked token) must not spin the cron loop
         console.error('inbox poll failed:', error instanceof Error ? error.message : error)
         return
       }
       if (!items.length) {
-        // Idle workspace: the answer came back instantly, so no waiter was
-        // held. Pause briefly, then poll again while budget remains.
-        if (Date.now() - pollStartedAt < HELD_POLL_THRESHOLD_MS) {
-          await sleep(IDLE_POLL_BACKOFF_MS)
-        }
+        // Enabled idle agents now long-poll too. An immediate empty response
+        // means no agents, wait disabled, or waiter capacity exhausted; retrying
+        // it here would recreate the HTTP/DB idle spin.
+        if (Date.now() - pollStartedAt < HELD_POLL_THRESHOLD_MS) return
         continue
       }
       for (const item of items) {
@@ -458,10 +443,6 @@ async function drainInbox(): Promise<void> {
   } finally {
     draining = false
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 async function executeInboxItem(item: InboxItem): Promise<void> {

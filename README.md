@@ -30,9 +30,11 @@ The Worker deploys with a once-a-minute cron trigger. Cron is only the wake-up:
 Worker. To keep pickup fast, one cron invocation keeps long-polling the inbox
 for ~50 seconds instead of quitting after one empty poll, so a waiter is
 registered almost continuously and a sent message is claimed within seconds.
-While the workspace is idle the backend answers instantly and the Worker backs
-off briefly. Change the schedule in the Cloudflare dashboard (**Workers → your
-worker → Triggers → Cron**).
+An idle workspace with enabled agents also holds a bounded request, so the
+first chat can wake it. No-agent or over-cap immediate empty responses end the
+drain until the next cron tick; there is no rapid empty-request retry loop.
+Change the schedule in the Cloudflare dashboard (**Workers → your worker →
+Triggers → Cron**).
 
 `workers_dev` and `preview_urls` are disabled: the Worker exposes an
 unauthenticated `POST /` that drains the inbox, so it must not be reachable on a
@@ -88,11 +90,17 @@ which backend a deployment is actually talking to.
 3. Drains the merged inbox: claims each queued turn (interactive chat replies
    and scheduled runs go through the same loop), executes it with tool access,
    streams deltas/tool events, and reports the final answer.
-4. Keeps long-polling the inbox until the invocation budget is spent: an active
-   workspace's request is held until something is enqueued (or up to 25
-   seconds), an idle one is answered instantly with a short backoff, so a chat
-   reply usually starts within seconds of being sent rather than at the next
-   minute boundary.
+4. Keeps long-polling the inbox until the invocation budget is spent: a workspace
+   with enabled agents holds its request until something is enqueued (or up to
+   25 seconds), even while idle. Each poll and its aborting timeout fit inside
+   the remaining budget. No-agent/over-cap immediate empty responses end the
+   drain and use the next cron tick as fallback.
+
+Deploy the backend inbox update before this Worker version. Older Workers can
+use the updated backend; this version treats immediate empty responses as a
+cron fallback, so an older activity-gated backend can delay an idle first chat
+until the next minute. Idle waits remain bounded by the backend timeout and
+its shared waiter admission cap.
 
 ## Scheduled runs (Durable Object per agent)
 Each agent gets one named SQLite Durable Object (`w:{workspace_id}:a:{agent_id}`)

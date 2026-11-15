@@ -69,3 +69,25 @@ export async function runtimeFetch(
   }
   return { ok: response.ok, status: response.status, body }
 }
+
+/** A poll must leave transport time inside, rather than beyond, the drain budget. */
+export function inboxPollBudget(remainingMs: number): { waitSeconds: number; timeoutMs: number } | null {
+  const waitSeconds = Math.min(25, Math.floor((remainingMs - 1_000) / 1_000))
+  if (waitSeconds <= 0) return null
+  return { waitSeconds, timeoutMs: Math.min(remainingMs, (waitSeconds + 15) * 1_000) }
+}
+
+/** The operation must pass the signal to fetch and consume the body before resolving. */
+export async function withRequestTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error(message)), ms)
+  try {
+    return await operation(controller.signal)
+  } finally {
+    clearTimeout(timer)
+  }
+}
