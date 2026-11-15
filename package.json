@@ -10,5 +10,18 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261113.1",
     "wrangler": "^4.0.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "WORKER_TOKEN": {
+        "description": "The `fng_aow_...` workspace token shown once on the Firmngin deploy card (AI Agents → Always-On Agent → Deploy Worker). It authorizes this Worker to your Firmngin workspace."
+      },
+      "MODEL_API_KEY": {
+        "description": "Your model provider key (OpenRouter, OpenAI, Anthropic, ...). **It stays in Cloudflare** — Firmngin never sees it."
+      },
+      "URL_BACKEND": {
+        "description": "Firmngin API base URL. Leave the committed default unless the deploy card tells you otherwise."
+      }
+    }
   }
 }
