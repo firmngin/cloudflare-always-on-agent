@@ -3,18 +3,17 @@
  * (safeJson / summarize, moved here from src/index.ts — the pi engine and the
  * builtin engine both use them).
  *
- * pi's Tool.parameters accepts ANY JSON Schema object (the vendored pi-schema
- * compiler validates plain JSON Schema directly, with coercion), so MCP tool
+ * pi's Tool.parameters accepts ANY JSON Schema object (pi-schema validates
+ * plain JSON Schema directly, with coercion), so MCP tool
  * inputSchema maps through as-is — no TypeBox conversion needed. Argument
- * validation/coercion happens in the vendored loop's validateToolArguments
- * before execute() runs; thrown errors become isError tool results the model
+ * validation/coercion happens in pi's loop before execute() runs; thrown errors become isError tool results the model
  * can react to.
  *
  * The McpClient itself stays in src/index.ts (existing MCP-over-HTTP client);
  * this module only wraps it, so it imports the client as a type only.
  */
 
-import type { AgentTool, AgentToolResult } from '../vendor/pi-agent/types'
+import type { AgentTool, AgentToolResult } from '@earendil-works/pi-agent-core'
 import type { McpClient } from '../index'
 
 export interface McpTool {
@@ -42,7 +41,7 @@ export function summarize(value: string): string {
 /**
  * Map every MCP tool the client listed into a pi AgentTool. execute() resolves
  * through mcp.call: thrown MCP errors (including isError results) propagate to
- * the vendored loop, which turns them into isError tool results — the same
+ * pi's loop, which turns them into isError tool results — the same
  * failure path the builtin engine takes.
  */
 export function mapMcpTools(client: McpClient): AgentTool[] {

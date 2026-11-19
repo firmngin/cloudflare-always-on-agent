@@ -2,8 +2,8 @@
  * pi-core turn engine.
  *
  * executeTurnPi() mirrors the builtin executeTurn signature/behavior
- * (agentId, claim, events -> final content string) but runs the vendored
- * pi agent loop (src/vendor/pi-agent/agent-loop.ts) with:
+ * (agentId, claim, events -> final content string) but runs pi's agent loop
+ * (runAgentLoop from @earendil-works/pi-agent-core) with:
  *   - context   : claim history (user/assistant turns) + the task prompt
  *                 (with the skills index appended) + the user message
  *   - tools     : MCP tools mapped to pi AgentTool[] + the load_skill builtin
@@ -23,8 +23,13 @@
  * otherwise '' — identical to the builtin engine's step loop.
  */
 
-import { runAgentLoop, type AgentEventSink } from '../vendor/pi-agent/agent-loop'
-import type { AgentLoopConfig, AgentTool, AgentToolResult } from '../vendor/pi-agent/types'
+import {
+  runAgentLoop,
+  type AgentEventSink,
+  type AgentLoopConfig,
+  type AgentTool,
+  type AgentToolResult,
+} from '@earendil-works/pi-agent-core'
 import {
   contentText,
   type Api,
@@ -34,7 +39,7 @@ import {
   type SystemMessage,
   type TextContent,
   type UserMessage,
-} from '../vendor/pi-ai/index'
+} from '@earendil-works/pi-ai'
 import type { Claim, EventStream, McpClient } from '../index'
 import { shouldConnectMcp } from '../runtime/turn'
 import type { SubrequestBudget } from '../runtime/subrequest-budget'

@@ -185,9 +185,10 @@ opted into on the agent in the Firmngin dashboard.
 ## Agent engine (pi core)
 
 Claimed turns run on the [pi](https://github.com/earendil-works/pi) agent
-core, vendored under `src/vendor/` (MIT — see `src/vendor/pi/NOTICE`): the
-agent loop with tool calling, argument validation/coercion via pi-schema, MCP
-tools mapped to pi `AgentTool`s, and skills — a claim may carry `skills`
+core, pinned to `@earendil-works/pi-agent-core` / `pi-ai` / `pi-schema` 1.5.2
+(exact versions, MIT; a direct dependency, not a vendored copy): the agent loop
+(`runAgentLoop`) with tool calling, argument validation/coercion via pi-schema,
+MCP tools mapped to pi `AgentTool`s, and skills — a claim may carry `skills`
 (name/description/content or raw SKILL.md); their index is appended to the
 system prompt and a builtin `load_skill(name)` tool serves the full content on
 demand (progressive disclosure). The BYOK provider adapters are unchanged: the

@@ -5,9 +5,9 @@
  * Messages streaming, moved here verbatim from src/index.ts so both engines
  * share them) speak the provider wire protocols with the user's own key. On
  * top of them this module implements pi's StreamFn contract
- * (src/vendor/pi-agent/types.ts): given a normalized pi transcript, call the
- * provider and emit the exact AssistantMessageEvent protocol the vendored
- * agent loop expects — `start` first, partial updates, then a terminal
+ * (@earendil-works/pi-agent-core): given a normalized pi transcript, call the
+ * provider and emit the exact AssistantMessageEvent protocol the pi agent loop
+ * expects — `start` first, partial updates, then a terminal
  * `done`/`error` carrying the final AssistantMessage.
  *
  * StreamFn contract (never throws): every request/model/runtime failure is
@@ -36,8 +36,8 @@ import {
 	type ToolCall,
 	type TranscriptContext,
 	type Usage,
-} from '../vendor/pi-ai/index'
-import type { StreamFn } from '../vendor/pi-agent/types'
+} from '@earendil-works/pi-ai'
+import type { StreamFn } from '@earendil-works/pi-agent-core'
 import { safeJson, type McpTool } from './tools'
 import { fetchWithBudget, type SubrequestBudget } from '../runtime/subrequest-budget'
 
@@ -412,7 +412,7 @@ async function callAnthropicModel(
 }
 
 // ---------------------------------------------------------------------------
-// pi StreamFn (the vendored agent loop calls this per assistant response)
+// pi StreamFn (the pi agent loop calls this per assistant response)
 // ---------------------------------------------------------------------------
 
 const EMPTY_USAGE: Usage = {

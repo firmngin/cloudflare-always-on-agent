@@ -5,9 +5,13 @@
   "description": "Firmngin data-agent runtime for Cloudflare Workers (user-owned, BYOK)",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node --experimental-transform-types --import ./tests/support/register-ts.mjs --test 'tests/*.test.ts'"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-schema": "1.5.2",
     "agents": "0.33.0"
   },
   "devDependencies": {

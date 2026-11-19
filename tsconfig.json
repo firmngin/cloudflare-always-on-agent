@@ -6,6 +6,9 @@
     "lib": ["es2022"],
     "types": ["@cloudflare/workers-types"],
     "strict": true,
+    // Dependency .d.ts files ship Node/DOM globals we cannot satisfy on Workers;
+    // only this repo's sources are checked.
+    "skipLibCheck": true,
     "noEmit": true,
     "allowImportingTsExtensions": true
   },

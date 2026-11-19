@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { callModel } from '../src/pi/stream-fn.ts'
+import { createSubrequestBudget } from '../src/runtime/subrequest-budget.ts'
 import { shouldConnectMcp, shouldFlushFirstDelta, turnBatchCapacity } from '../src/runtime/turn.ts'
 
 test('MCP preflight is skipped only for an authoritative false claim', () => {
@@ -35,6 +36,7 @@ test('model provider request receives and observes the turn abort signal', async
   try {
     const controller = new AbortController()
     const pending = callModel(
+      createSubrequestBudget(),
       'test-model',
       [{ role: 'user', content: 'hello' }],
       [],

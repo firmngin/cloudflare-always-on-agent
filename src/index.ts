@@ -7,10 +7,11 @@
  * model endpoint with the user's own provider key, streams tool calls and
  * deltas back to Firmngin, and reports the final result.
  *
- * Turn engine: the default engine runs pi's agent core (vendored under
- * src/vendor/, MIT — see src/vendor/pi/NOTICE): the agent loop with tool
- * calling, MCP tools mapped to pi AgentTool[], and skills (progressive
- * disclosure via a load_skill tool). The adapter layer lives in src/pi/.
+ * Turn engine: the default engine runs pi's agent core from the pinned
+ * official packages (`@earendil-works/pi-agent-core` / `pi-ai` / `pi-schema`
+ * 1.5.2, MIT): runAgentLoop with tool calling, MCP tools mapped to pi
+ * AgentTool[], and skills (progressive disclosure via a load_skill tool). The
+ * adapter layer lives in src/pi/.
  * Set AGENT_ENGINE="builtin" to fall back to the previous hand-rolled loop
  * (kept intact below as executeTurnBuiltin).
  *
@@ -135,7 +136,7 @@ export interface Env {
   MODEL_MAX_TOKENS?: string
   MAX_STEPS?: string
   /**
-   * Turn engine: "pi" (default) runs the vendored pi agent core; "builtin"
+   * Turn engine: "pi" (default) runs the pinned pi agent core; "builtin"
    * runs the previous hand-rolled loop. Any other value falls back to "pi".
    */
   AGENT_ENGINE?: string
@@ -155,7 +156,7 @@ export interface Env {
   SUBREQUEST_BUDGET?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.10'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.11'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.

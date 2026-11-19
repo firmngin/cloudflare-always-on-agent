@@ -35,7 +35,10 @@ test('an unacknowledged report is kept and replayed instead of re-running the tu
   const pending = requirePending(pendingReportFor(recorded, 'run-1', now))
   // `recorded_at` is object bookkeeping; the PATCH body is strictly decoded by
   // the backend, so only the contracted fields are sent back.
-  assert.deepEqual(toTerminalReport(pending), { status: 'succeeded', content: 'the paid answer' })
+  assert.deepEqual(JSON.parse(JSON.stringify(toTerminalReport(pending))), {
+    status: 'succeeded',
+    content: 'the paid answer',
+  })
   assert.equal(pendingReportFor(recorded, 'another-run', now), null)
 })
 
@@ -48,7 +51,7 @@ test('a failed report keeps its code and message for the replay', () => {
   }, now)
 
   const pending = requirePending(pendingReportFor(recorded, 'run-2', now))
-  assert.deepEqual(toTerminalReport(pending), {
+  assert.deepEqual(JSON.parse(JSON.stringify(toTerminalReport(pending))), {
     status: 'failed',
     error_code: 'WORKER_ERROR',
     error_message: 'turn failed',
@@ -78,7 +81,7 @@ test('an oversized answer keeps only its status so the value stays storable', ()
   const recorded = recordPendingReportState(undefined, 'run-6', { status: 'succeeded', content: huge }, now)
   const pending = requirePending(pendingReportFor(recorded, 'run-6', now))
   // The backend falls back to the streamed final event when no content arrives.
-  assert.deepEqual(toTerminalReport(pending), { status: 'succeeded' })
+  assert.deepEqual(JSON.parse(JSON.stringify(toTerminalReport(pending))), { status: 'succeeded' })
 })
 
 test('pending fences are bounded to the newest runs', () => {

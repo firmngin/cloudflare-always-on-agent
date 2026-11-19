@@ -12,7 +12,7 @@
  * about and skipped — never thrown.
  */
 
-import type { AgentTool, AgentToolResult } from '../vendor/pi-agent/types'
+import type { AgentTool, AgentToolResult } from '@earendil-works/pi-agent-core'
 
 /** A skill entry on the claim (all fields optional so old backends keep working). */
 export interface SkillClaim {
@@ -106,8 +106,8 @@ export function createLoadSkillTool(skills: SkillDefinition[]): AgentTool[] {
       'Load the full instructions of a skill listed in the skills index. Call this before working in the skill\'s area.',
     parameters: LOAD_SKILL_PARAMETERS,
     async execute(_toolCallId: string, params: unknown): Promise<AgentToolResult<any>> {
-      // Throwing (unknown name, bad arguments) is the contract: the vendored
-      // loop converts it into an isError tool result the model can act on.
+      // Throwing (unknown name, bad arguments) is the contract: the pi loop
+      // converts it into an isError tool result the model can act on.
       const name = isRecord(params) ? params.name : undefined
       if (typeof name !== 'string' || !name.trim()) {
         throw new Error('The "name" argument must be a skill name from the skills index')
