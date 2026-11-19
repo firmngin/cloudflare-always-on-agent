@@ -3,3 +3,5 @@
 # never commit real secrets.
 WORKER_TOKEN=replace_with_fng_aow_token_from_the_firmngin_dashboard
 MODEL_API_KEY=replace_with_your_model_provider_key
+WAKE_SECRET=replace_with_independent_random_32_byte_secret
+WAKE_CALLBACK_URL=https://your-private-worker-route.example.com/v1/wake

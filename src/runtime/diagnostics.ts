@@ -1,4 +1,5 @@
 import { isPlaceholderToken, resolveBackendUrl, runtimePath, withRequestTimeout, type BackendEnvLike } from './endpoints.ts'
+import { fetchWithBudget, type SubrequestBudget } from './subrequest-budget.ts'
 
 export interface RuntimeTrace {
   invocation_id: string
@@ -74,6 +75,7 @@ async function boundedJson(response: Response): Promise<Record<string, any> | nu
 export async function traceRegistration(
   trace: RuntimeTrace, backend: string, token: string,
   kind: 'heartbeat' | 'handshake', payload: Record<string, string>,
+  budget: SubrequestBudget,
 ): Promise<void> {
   const traceId = crypto.randomUUID()
   const started = Date.now()
@@ -82,11 +84,13 @@ export async function traceRegistration(
   let status = 0, backendRequestId = '', cfRay = '', responseFormat = ''
   try {
     await withRequestTimeout(async (signal) => {
-      const response = await fetch(runtimePath(backend, `/${kind}`), {
+      // Registration is diagnostic: it must never take the headroom a turn's
+      // terminal report needs, so it spends the best-effort tier.
+      const response = await fetchWithBudget(budget, runtimePath(backend, `/${kind}`), {
         method: 'POST', signal,
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'X-Trace-Id': traceId },
         body: JSON.stringify(payload),
-      })
+      }, 'bestEffort')
       status = response.status
       backendRequestId = safeId(response.headers.get('x-request-id'))
       const ray = response.headers.get('cf-ray') || ''

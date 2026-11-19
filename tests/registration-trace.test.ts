@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { runtimeTrace, traceRegistration } from '../src/runtime/diagnostics.ts'
+import { createSubrequestBudget } from '../src/runtime/subrequest-budget.ts'
 
 test('runtime trace strips URL credentials/query/fragment and logs token presence only', () => {
   const trace = runtimeTrace({
@@ -34,7 +35,7 @@ test('registration failure retains status and correlation without raw body detai
   console.log = (entry) => { logs.push(entry) }
   console.error = (entry) => { logs.push(entry) }
   try {
-    await traceRegistration(trace, 'https://example.com', 'fng_aow_private-token', 'heartbeat', { version: 'test' })
+    await traceRegistration(trace, 'https://example.com', 'fng_aow_private-token', 'heartbeat', { version: 'test' }, createSubrequestBudget())
     const response = logs.find((entry) => entry.event === 'runtime.heartbeat.response')
     assert.equal(response?.status, 401)
     assert.equal(response?.error_code, 'INVALID_TOKEN')

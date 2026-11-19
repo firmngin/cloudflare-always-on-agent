@@ -47,6 +47,9 @@ export function runtimePath(apiUrl: string, path: string): string {
 }
 
 /** JSON POST/GET helper against the worker runtime surface; returns parsed body. */
+// Named Durable Objects call this from their OWN invocation: a DO has its own
+// subrequest limit, so it is deliberately not charged to the Worker's
+// per-invocation budget (src/runtime/subrequest-budget.ts).
 export async function runtimeFetch(
   apiUrl: string,
   workerToken: string,

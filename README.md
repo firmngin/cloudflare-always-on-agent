@@ -22,23 +22,30 @@ click **Deploy to Cloudflare**. The wizard asks for:
 |---|---|
 | `WORKER_TOKEN` (secret) | the workspace Worker token (`fng_aow_...`) — shown once next to the deploy button |
 | `MODEL_API_KEY` (secret) | your model provider key (OpenRouter, OpenAI, ...) |
+| `WAKE_SECRET` (secret) | an independent random secret of at least 32 bytes |
+| `WAKE_CALLBACK_URL` (variable) | an explicit HTTPS custom route ending exactly in `/v1/wake` |
 
 There is no agent id and no agent form: the Worker is workspace-level.
 
-The Worker deploys with a once-a-minute cron trigger. Cron is only the wake-up:
-`workers_dev`/preview URLs are disabled so Firmngin can never call into your
-Worker. To keep pickup fast, one cron invocation keeps long-polling the inbox
-for ~50 seconds instead of quitting after one empty poll, so a waiter is
-registered almost continuously and a sent message is claimed within seconds.
+The Worker deploys with a once-a-minute recovery cron. Realtime provisioning is
+not complete until the custom route, `WAKE_CALLBACK_URL`, and `WAKE_SECRET`
+exist and the authenticated handshake succeeds. The public wake route remains
+fail-closed before that point, while existing outbound cron recovery continues.
+Firmngin then calls only signed `POST /v1/wake` for realtime work. For recovery,
+each cron invocation keeps long-polling the inbox
+for up to ~59 seconds instead of quitting after one empty poll, so a waiter is
+registered nearly continuously. Actual pickup still depends on Cloudflare cron
+scheduling, network latency, backend processing, and the model provider.
 An idle workspace with enabled agents also holds a bounded request, so the
 first chat can wake it. No-agent or over-cap immediate empty responses end the
 drain until the next cron tick; there is no rapid empty-request retry loop.
 Change the schedule in the Cloudflare dashboard (**Workers → your worker →
 Triggers → Cron**).
 
-`workers_dev` and `preview_urls` are disabled: the Worker exposes an
-unauthenticated `POST /` that drains the inbox, so it must not be reachable on a
-public hostname.
+`workers_dev` and `preview_urls` remain disabled. The former unauthenticated
+`POST /` drain is closed; only `/v1/wake` accepts POST and requires a signed,
+timestamped, replay-protected request. Provisioning must create a real HTTPS
+custom route—the Worker name is never converted into a guessed URL.
 
 ## Manual deploy
 
@@ -46,6 +53,9 @@ public hostname.
 npm install
 npx wrangler secret put WORKER_TOKEN
 npx wrangler secret put MODEL_API_KEY
+npx wrangler secret put WAKE_SECRET
+# Create the HTTPS custom route, then set its exact /v1/wake URL as
+# WAKE_CALLBACK_URL in the Worker variables to enable realtime wake.
 npx wrangler deploy
 ```
 
@@ -89,7 +99,12 @@ which backend a deployment is actually talking to.
    than one scheduler per agent.
 3. Drains the merged inbox: claims each queued turn (interactive chat replies
    and scheduled runs go through the same loop), executes it with tool access,
-   streams deltas/tool events, and reports the final answer.
+   streams deltas/tool events, and reports the final answer. Capacity is per
+   lane, from the backend-assigned one: 2 interactive turns and 1 background
+   turn (scheduled/manual/analysis) per isolate, so an analysis cannot hold a
+   chat slot. A poll plans both lanes before starting anything and dispatches
+   them concurrently, so a saturated background lane cannot delay chat pickup in
+   the same poll.
 4. Keeps long-polling the inbox until the invocation budget is spent: a workspace
    with enabled agents holds its request until something is enqueued (or up to
    25 seconds), even while idle. Each poll and its aborting timeout fit inside
@@ -113,19 +128,23 @@ declared in `wrangler.toml`; `npm install` pulls `agents@0.33.0`
 (`nodejs_compat` is enabled for it). See
 `firmnginbe/docs/architecture/data-agent-durable-objects.md` for the contract.
 
-The default deployment has no public probe URL: `workers_dev` and previews are
-disabled. Trace deployment through scheduled invocation logs below. The existing
-GET/POST handler is usable only if you already operate a deliberately configured
-private route; do not expose it publicly to troubleshoot pairing.
+The repository deliberately contains no guessed public callback URL. Until
+provisioning supplies a custom route plus `WAKE_CALLBACK_URL` and
+`WAKE_SECRET`, `POST /v1/wake` returns `503`; the existing outbound cron and
+bounded long-poll remain available as staged-rollout recovery.
 
 ## Pairing and runtime config
 
-On every cron invocation the Worker sends an outbound `POST /handshake`
-(`runtime_version` + a correlation nonce) so the workspace deployment moves
-`pending → connected` explicitly; repeating it is a no-op except for liveness.
+On each cron recovery invocation, the Worker sends an authenticated outbound
+`POST /handshake`. Once both wake settings are valid it includes the exact wake
+URL and reverse secret; Firmngin encrypts the secret at rest and never returns
+it. Missing or partially staged wake settings do not stop the existing cron
+fallback, but the inbound wake route remains disabled.
 Its agent roster comes from `GET /deployment/config`, which is scoped to the
 Worker token and carries the workspace id needed for the Durable Object name.
-Both are worker-token routes — Firmngin still never calls into your Worker.
+Both outbound routes use the worker token. The reverse direction is limited to
+the separately signed, replay-protected `POST /v1/wake`; the model provider key
+never leaves Cloudflare.
 
 ## Tools (MCP)
 
@@ -151,8 +170,41 @@ loop (`executeTurnBuiltin`).
 
 - A turn is abandoned (reported `failed`) after 4 minutes — Firmngin's own
   deadline is 5.
-- At most 10 turns are claimed per invocation and at most 2 run at once; the
-  rest wait for the next tick.
+- At most 10 turns are claimed per invocation and at most 2 chat turns (plus 1
+  background turn) run at once; the rest wait for the next tick.
+- **Subrequests are budgeted per invocation.** A Worker invocation may make 50
+  subrequests on the Workers Free plan and 10,000 on Paid, and each hop of a
+  redirect chain counts as one more, so the platform total can exceed the number
+  of `fetch()` calls in the code. The limit is not visible to the code, so the
+  runtime assumes the Free floor and gives **every invocation its own budget**:
+  one cron tick (inside its `ctx.waitUntil`) and one streaming `/v1/wake` request
+  each hold an isolated counter, so overlapping invocations on one isolate can
+  neither refill nor poison each other. Inside an invocation it spends in three
+  tiers: best-effort event batches and retries first (coalesced by 32 events /
+  4 KB / 300 ms, first delta still flushed immediately), essential work (claims,
+  model steps, MCP calls, inbox long-polls) next, and the run's terminal report
+  last. Every run reserves its own terminal headroom (two PATCH attempts plus one
+  optional `message.final`/`error` batch) **before** its claim, so up to three
+  concurrent runs can never spend each other's report slots. When the budget
+  runs out the turn still reports `succeeded` or `failed` and the drain ends
+  instead of failing its next poll; the queued turn is picked up by the next cron
+  tick. A failed event batch is re-queued, not dropped, so `seq` stays monotonic,
+  and an ambiguous report is retried as the idempotent PATCH only — paid
+  model/tool work is never re-run just to resend an acknowledged finish.
+- A finished turn's terminal report counts as done only when Firmngin answers
+  **2xx**. An already-final run replays as 2xx (`FinishRun` re-reads the terminal
+  row), but **409 is not an ack**: it means the run is still `queued` or the
+  agent moved to the legacy executor, so the report was not applied. On any
+  non-2xx (`ambiguous`, `unsent`, `rejected`) the finished payload is kept on the
+  agent's Durable Object (`pending_reports_v1`) and the wake event stays open, so
+  the backend's retry replays that report instead of re-entering the model turn
+  (`ClaimMessage` would resume the same claim). A pending report expires after
+  30 minutes; past that the backend stale-run reaper owns the run.
+- A deployment that raised `[limits] subrequests` (see `wrangler.toml`) must
+  mirror that number in the `SUBREQUEST_BUDGET` var. Leave both unset on the Free
+  plan. Setting it above the real platform value is not a guarantee: the runtime
+  keeps a small redirect headroom and stops on the first platform rejection, but
+  it cannot predict a limit it cannot read.
 - Model calls use streaming with `tools` in OpenAI format; each agent's model
   id is passed to the provider unchanged.
 

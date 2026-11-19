@@ -39,6 +39,7 @@ import {
 } from '../vendor/pi-ai/index'
 import type { StreamFn } from '../vendor/pi-agent/types'
 import { safeJson, type McpTool } from './tools'
+import { fetchWithBudget, type SubrequestBudget } from '../runtime/subrequest-budget'
 
 export class ApiError extends Error {
   constructor(readonly status: number, message: string, readonly errorCode = '') {
@@ -56,12 +57,16 @@ export interface ChatMessage {
   name?: string
 }
 
-export async function* sseDataLines(response: Response): AsyncGenerator<string> {
+export async function* sseDataLines(response: Response, signal?: AbortSignal): AsyncGenerator<string> {
   const reader = response.body?.getReader()
   if (!reader) return
   const decoder = new TextDecoder()
   let buffer = ''
   while (true) {
+    if (signal?.aborted) {
+      await reader.cancel(signal.reason).catch(() => {})
+      throw signal.reason instanceof Error ? signal.reason : new Error('Request aborted')
+    }
     const { done, value } = await reader.read()
     if (done) break
     buffer += decoder.decode(value, { stream: true })
@@ -134,6 +139,7 @@ function anthropicMaxTokens(): number {
 }
 
 export async function callModel(
+  budget: SubrequestBudget,
   model: string,
   messages: ChatMessage[],
   tools: McpTool[],
@@ -142,19 +148,24 @@ export async function callModel(
   // older backends and custom deployments keep working.
   baseUrlOverride?: string,
   protocol: ModelProtocol = 'openai',
+  signal?: AbortSignal,
+  runId?: string,
 ): Promise<ModelTurnResult> {
   if (protocol === 'anthropic') {
-    return callAnthropicModel(model, messages, tools, onDelta, baseUrlOverride)
+    return callAnthropicModel(budget, model, messages, tools, onDelta, baseUrlOverride, signal, runId)
   }
-  return callOpenAIModel(model, messages, tools, onDelta, baseUrlOverride)
+  return callOpenAIModel(budget, model, messages, tools, onDelta, baseUrlOverride, signal, runId)
 }
 
 async function callOpenAIModel(
+  budget: SubrequestBudget,
   model: string,
   messages: ChatMessage[],
   tools: McpTool[],
   onDelta: (text: string) => Promise<void>,
   baseUrlOverride?: string,
+  signal?: AbortSignal,
+  runId?: string,
 ): Promise<ModelTurnResult> {
   const base = trimSlash(baseUrlOverride || modelBase || 'https://openrouter.ai/api/v1')
   const body: Record<string, unknown> = { model, messages, stream: true }
@@ -165,14 +176,16 @@ async function callOpenAIModel(
     }))
   }
 
-  const response = await fetch(`${base}/chat/completions`, {
+  const requestStartedAt = Date.now()
+  const response = await fetchWithBudget(budget, `${base}/chat/completions`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${modelApiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
-  })
+    signal,
+  }, 'essential')
   if (!response.ok) {
     const detail: any = await response.json().catch(() => null)
     const message = detail?.error?.message || detail?.message || `Model provider returned ${response.status}`
@@ -184,7 +197,8 @@ async function callOpenAIModel(
 
   let content = ''
   const calls = new Map<number, ToolCallAccumulator>()
-  for await (const data of sseDataLines(response)) {
+  let firstDeltaAt = 0
+  for await (const data of sseDataLines(response, signal)) {
     if (!data || data === '[DONE]') continue
     let chunk: any
     try {
@@ -195,6 +209,15 @@ async function callOpenAIModel(
     const delta = chunk?.choices?.[0]?.delta
     if (!delta) continue
     if (typeof delta.content === 'string' && delta.content.length) {
+      if (!firstDeltaAt) {
+        firstDeltaAt = Date.now()
+        console.log({
+          event: 'run.stage',
+          run_id: runId,
+          stage: 'provider_first_delta',
+          duration_ms: firstDeltaAt - requestStartedAt,
+        })
+      }
       content += delta.content
       await onDelta(delta.content)
     }
@@ -285,11 +308,14 @@ function toAnthropicMessages(messages: ChatMessage[]): { system: string, message
 }
 
 async function callAnthropicModel(
+  budget: SubrequestBudget,
   model: string,
   messages: ChatMessage[],
   tools: McpTool[],
   onDelta: (text: string) => Promise<void>,
   baseUrlOverride?: string,
+  signal?: AbortSignal,
+  runId?: string,
 ): Promise<ModelTurnResult> {
   const { system, messages: anthropicMessages } = toAnthropicMessages(messages)
   const body: Record<string, unknown> = {
@@ -307,7 +333,8 @@ async function callAnthropicModel(
     }))
   }
 
-  const response = await fetch(anthropicEndpoint(baseUrlOverride), {
+  const requestStartedAt = Date.now()
+  const response = await fetchWithBudget(budget, anthropicEndpoint(baseUrlOverride), {
     method: 'POST',
     headers: {
       'x-api-key': modelApiKey,
@@ -315,7 +342,8 @@ async function callAnthropicModel(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(body),
-  })
+    signal,
+  }, 'essential')
   if (!response.ok) {
     const detail: any = await response.json().catch(() => null)
     const message = detail?.error?.message || detail?.message || `Model provider returned ${response.status}`
@@ -330,7 +358,8 @@ async function callAnthropicModel(
   // each accumulator holds the growing JSON string until its block stops.
   const calls = new Map<number, ToolCallAccumulator>()
   let activeToolIndex = -1
-  for await (const data of sseDataLines(response)) {
+  let firstDeltaAt = 0
+  for await (const data of sseDataLines(response, signal)) {
     if (!data) continue
     let chunk: any
     try {
@@ -353,6 +382,15 @@ async function callAnthropicModel(
     if (chunk?.type === 'content_block_delta') {
       const delta = chunk?.delta
       if (delta?.type === 'text_delta' && delta.text) {
+        if (!firstDeltaAt) {
+          firstDeltaAt = Date.now()
+          console.log({
+            event: 'run.stage',
+            run_id: runId,
+            stage: 'provider_first_delta',
+            duration_ms: firstDeltaAt - requestStartedAt,
+          })
+        }
         content += delta.text
         await onDelta(delta.text)
       } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
@@ -387,9 +425,13 @@ const EMPTY_USAGE: Usage = {
 }
 
 export interface StreamFnConfig {
+  /** Invocation budget every provider request is charged to. */
+  budget: SubrequestBudget
   /** Per-agent base URL from the claim, resolved exactly as the builtin engine resolves it. */
   baseUrlOverride?: string
   protocol: ModelProtocol
+  signal?: AbortSignal
+  runId?: string
 }
 
 /**
@@ -435,7 +477,7 @@ async function streamModelResponse(
     stream.push({ type: 'start', partial })
 
     let textStarted = false
-    const result = await callModel(model.id, messages, tools, async (text) => {
+    const result = await callModel(config.budget, model.id, messages, tools, async (text) => {
       if (!textStarted) {
         textStarted = true
         partial.content.push({ type: 'text', text: '' } as TextContent)
@@ -444,7 +486,7 @@ async function streamModelResponse(
       const block = partial.content[0] as TextContent
       block.text += text
       stream.push({ type: 'text_delta', contentIndex: 0, delta: text, partial })
-    }, config.baseUrlOverride, config.protocol)
+    }, config.baseUrlOverride, config.protocol, config.signal, config.runId)
     if (textStarted) {
       stream.push({ type: 'text_end', contentIndex: 0, content: (partial.content[0] as TextContent).text, partial })
     }

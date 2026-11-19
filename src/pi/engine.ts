@@ -36,22 +36,35 @@ import {
   type UserMessage,
 } from '../vendor/pi-ai/index'
 import type { Claim, EventStream, McpClient } from '../index'
+import { shouldConnectMcp } from '../runtime/turn'
+import type { SubrequestBudget } from '../runtime/subrequest-budget'
 import { ApiError, createStreamFn, resolveModelProtocol, type ModelProtocol } from './stream-fn'
 import { mapMcpTools, summarize } from './tools'
 import { createLoadSkillTool, parseSkills, renderSkillsIndex } from './skills'
 
 export interface PiEngineDeps {
   /** The template's MCP token exchange + client connect (src/index.ts). */
-  connectMcp(agentId: string): Promise<McpClient | null>
+  connectMcp(agentId: string, signal?: AbortSignal): Promise<McpClient | null>
   /** MAX_STEPS, resolved by the caller with the same expression the builtin engine uses. */
   maxSteps: number
+  /** The invocation's subrequest budget: every provider request is charged to it. */
+  budget: SubrequestBudget
 }
 
-export async function executeTurnPi(agentId: string, claim: Claim, events: EventStream, deps: PiEngineDeps): Promise<string> {
+export async function executeTurnPi(agentId: string, claim: Claim, events: EventStream, deps: PiEngineDeps, signal?: AbortSignal): Promise<string> {
   const model = claim.model
   if (!model) throw new ApiError(0, 'Agent config has no model', 'CONFIG_INVALID')
   const protocol = resolveModelProtocol(claim)
-  const mcp = await deps.connectMcp(agentId)
+  const mcpStartedAt = Date.now()
+  const mcpEnabled = shouldConnectMcp(claim)
+  const mcp = mcpEnabled ? await deps.connectMcp(agentId, signal) : null
+  console.log({
+    event: 'run.stage',
+    run_id: claim.run_id,
+    stage: 'mcp_preflight',
+    duration_ms: Date.now() - mcpStartedAt,
+    enabled: mcpEnabled,
+  })
 
   const skills = parseSkills(claim.skills)
   const skillsIndex = renderSkillsIndex(skills)
@@ -140,29 +153,34 @@ export async function executeTurnPi(agentId: string, claim: Claim, events: Event
     [promptMessage, userMessage],
     { messages: history, tools },
     config,
-    mapAgentEvents(events),
-    undefined,
-    createStreamFn({ baseUrlOverride: claim.model_base_url, protocol }),
+    mapAgentEvents(events, signal),
+    signal,
+    createStreamFn({
+      budget: deps.budget,
+      baseUrlOverride: claim.model_base_url,
+      protocol,
+      signal,
+      runId: claim.run_id,
+    }),
   )
 
   if (finalAssistant && (finalAssistant.stopReason === 'error' || finalAssistant.stopReason === 'aborted')) {
     throw turnFailure(finalAssistant)
   }
-  await events.flush()
+  await events.flush('bestEffort', signal)
   return finalContent
 }
 
 /** pi AgentEvent -> runtime EventStream events, with unchanged payload shapes and names. */
-function mapAgentEvents(events: EventStream): AgentEventSink {
+function mapAgentEvents(events: EventStream, signal?: AbortSignal): AgentEventSink {
   return async (event) => {
     if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
-      events.push('delta', event.assistantMessageEvent.delta)
-      await events.flushIfLarge()
+      await events.pushDelta(event.assistantMessageEvent.delta, signal)
       return
     }
     if (event.type === 'tool_execution_start') {
       // args are already parsed argument objects (pi normalizes them).
-      await events.pushAndFlush('tool.call', JSON.stringify({ name: event.toolName, arguments: event.args }))
+      await events.pushAndFlush('tool.call', JSON.stringify({ name: event.toolName, arguments: event.args }), signal)
       return
     }
     if (event.type === 'tool_execution_end') {
@@ -172,6 +190,7 @@ function mapAgentEvents(events: EventStream): AgentEventSink {
         event.isError
           ? JSON.stringify({ name: event.toolName, error: text })
           : JSON.stringify({ name: event.toolName, summary: summarize(text) }),
+        signal,
       )
     }
   }

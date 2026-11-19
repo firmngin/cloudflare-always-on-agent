@@ -2,20 +2,18 @@ name = "firmngin-data-agent"
 main = "src/index.ts"
 compatibility_date = "2026-11-15"
 # `agents` (Lifecycle + Scheduler) requires nodejs_compat.
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = ["nodejs_compat", "enable_request_signal"]
 
-# This Worker is driven by Cloudflare (cron) and long-polling, not by inbound
-# HTTP. Leaving the public workers.dev hostname and preview URLs enabled would
-# publish an unauthenticated endpoint that can drain the inbox, so both are off.
+# Public workers.dev and preview hostnames stay off. Realtime ingress requires
+# an explicitly provisioned custom route ending in /v1/wake; that route is
+# HMAC-authenticated and the former unauthenticated POST / drain is closed.
 workers_dev = false
 preview_urls = false
 
-# Runs once a minute. This Worker is long-poll driven: the cron tick is what
-# wakes it to heartbeat and pick up queued chat turns, because the backend never
-# calls into the Worker and workers.dev is disabled below. An hourly tick made
-# a freshly deployed Worker look dead for up to an hour. Scheduled agent runs
-# stay hourly regardless: their idempotency key is hour-bucketed, so extra ticks
-# reuse the same run instead of creating duplicates.
+# Runs once a minute as recovery and heartbeat. When WAKE_CALLBACK_URL and
+# WAKE_SECRET are registered, Firmngin dispatches queued turns immediately;
+# cron long-poll catches a missed or unavailable callback without becoming a
+# second scheduler. Legacy scheduled runs remain hour-bucket idempotent.
 [triggers]
 crons = ["* * * * *"]
 
@@ -54,6 +52,25 @@ MODEL_MAX_TOKENS = "8192"
 # Safety bound for tool-calling steps inside one turn.
 MAX_STEPS = "8"
 
+# Subrequests per invocation this deployment may spend. The runtime assumes the
+# Workers Free floor (50) when unset, so a paid-plan raise must be mirrored here:
+#
+# [limits]
+# subrequests = 1000
+#
+# [vars]
+# SUBREQUEST_BUDGET = "1000"
+#
+# The budget is per invocation: a cron tick and each streaming /v1/wake request
+# each get their own counter, and every run reserves its own terminal report
+# before it is claimed.
+#
+# Never set SUBREQUEST_BUDGET above the platform value, and do not read it as a
+# guarantee: redirect hops count as extra subrequests, so the runtime keeps a
+# couple of slots unspent and stops on the first platform rejection. If the var
+# mirrors a higher limit than the deployment really has, the terminal run report
+# is still what gets lost.
+
 # Per-agent Durable Object sync (Lifecycle + Scheduler). Leave "false" until the
 # backend exposes GET /agent-runtime/worker/agents/:id/schedules; while false the
 # once-a-minute cron hour-bucket remains the only scheduler (never both).
@@ -63,6 +80,12 @@ AGENT_DO_SYNC = "false"
 #   WORKER_TOKEN  - the workspace Worker token (fng_aow_...) shown once in the
 #                   Firmngin dashboard. One deployment serves every agent.
 #   MODEL_API_KEY - your model provider key; never sent to Firmngin.
+#   WAKE_SECRET   - an independent random secret (32+ bytes) shared only with
+#                   Firmngin through the authenticated handshake.
+# Realtime var, set after provisioning the HTTPS custom route. The inbound wake
+# route is fail-closed until this exact URL and WAKE_SECRET are present; cron
+# recovery remains available during staged rollout:
+#   WAKE_CALLBACK_URL - exact public URL ending in /v1/wake.
 
 # Persist correlated registration diagnostics in Cloudflare Workers Logs.
 [observability]

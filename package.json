@@ -22,6 +22,12 @@
       "MODEL_API_KEY": {
         "description": "Your model provider key (OpenRouter, OpenAI, Anthropic, ...). **It stays in Cloudflare** — Firmngin never sees it."
       },
+      "WAKE_SECRET": {
+        "description": "Independent random secret of at least 32 bytes used only to authenticate Firmngin realtime wake requests. Do not reuse your Worker token or model key."
+      },
+      "WAKE_CALLBACK_URL": {
+      "description": "Public HTTPS custom-route URL ending exactly in `/v1/wake`. Provision the route first; realtime ingress stays fail-closed until this value is registered while cron recovery remains available."
+      },
       "URL_BACKEND": {
         "description": "Firmngin API base URL. Leave the committed default unless the deploy card tells you otherwise."
       }

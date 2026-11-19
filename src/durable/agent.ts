@@ -21,6 +21,20 @@ import { DurableObject } from 'cloudflare:workers'
 import { Lifecycle } from 'agents/lifecycle'
 import { Scheduler, type Schedule } from 'agents/schedules'
 import { resolveBackendUrl, runtimeFetch, type BackendEnvLike } from '../runtime/endpoints'
+import {
+  clearPendingReportState,
+  pendingReportFor,
+  recordPendingReportState,
+  type PendingReportState,
+  type PendingRunReport,
+} from '../runtime/pending-report'
+import type { TerminalRunReport } from '../runtime/turn'
+import {
+  authorizeWakeState,
+  completeWakeState,
+  releaseWakeState,
+  type WakeSecurityState,
+} from '../runtime/wake-security'
 
 export interface WorkspaceAgentEnv extends BackendEnvLike {
   WORKER_TOKEN: string
@@ -68,6 +82,8 @@ interface DueRunPayload extends Record<string, unknown> {
 const APPLIED_VERSION_KEY = 'applied_version'
 const APPLIED_CONFIG_VERSION_KEY = 'applied_config_version'
 const LAST_WAKE_KEY = 'last_wake_at'
+const WAKE_SECURITY_KEY = 'wake_security_v1'
+const PENDING_REPORTS_KEY = 'pending_reports_v1'
 
 export function durableObjectName(workspaceID: string, agentID: string): string {
   return `w:${workspaceID}:a:${agentID}`
@@ -91,6 +107,69 @@ export class WorkspaceAgent extends DurableObject<WorkspaceAgentEnv> {
   })
 
   readonly lifecycle = Lifecycle.install(this).use(this.scheduler)
+
+  /** Durable replay/rate/event gate for authenticated realtime wakes. */
+  async authorizeWake(input: {
+    workspace_id: string
+    agent_id: string
+    event_id: string
+    nonce: string
+    now: number
+  }): Promise<{ accepted: boolean, duplicate: boolean, duplicate_completed: boolean, rate_limited: boolean }> {
+    const identity = this.identity()
+    if (input.workspace_id !== identity.workspaceID || input.agent_id !== identity.agentID) {
+      return { accepted: false, duplicate: false, duplicate_completed: false, rate_limited: false }
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<WakeSecurityState>(WAKE_SECURITY_KEY)
+      const decision = authorizeWakeState(current, input.nonce, input.event_id, input.now)
+      await txn.put(WAKE_SECURITY_KEY, decision.state)
+      return {
+        accepted: decision.accepted,
+        duplicate: decision.duplicate,
+        duplicate_completed: decision.duplicateCompleted,
+        rate_limited: decision.rateLimited,
+      }
+    })
+  }
+
+  async completeWake(eventId: string): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      const current = (await txn.get<WakeSecurityState>(WAKE_SECURITY_KEY)) || { nonces: {}, events: {}, requests: [] }
+      await txn.put(WAKE_SECURITY_KEY, completeWakeState(current, eventId, Date.now()))
+    })
+  }
+
+  async releaseWake(eventId: string): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      const current = (await txn.get<WakeSecurityState>(WAKE_SECURITY_KEY)) || { nonces: {}, events: {}, requests: [] }
+      await txn.put(WAKE_SECURITY_KEY, releaseWakeState(current, eventId))
+    })
+  }
+
+  /**
+   * Durable fence for a turn that finished but whose terminal report was never
+   * acknowledged. The next wake for this run replays the report instead of
+   * re-entering the turn, so a retry cannot re-spend the user's model key.
+   */
+  async getPendingReport(runId: string): Promise<PendingRunReport | null> {
+    const state = await this.ctx.storage.get<PendingReportState>(PENDING_REPORTS_KEY)
+    return pendingReportFor(state, runId, Date.now())
+  }
+
+  async recordPendingReport(runId: string, report: TerminalRunReport): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<PendingReportState>(PENDING_REPORTS_KEY)
+      await txn.put(PENDING_REPORTS_KEY, recordPendingReportState(current, runId, report, Date.now()))
+    })
+  }
+
+  async clearPendingReport(runId: string): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<PendingReportState>(PENDING_REPORTS_KEY)
+      await txn.put(PENDING_REPORTS_KEY, clearPendingReportState(current, runId, Date.now()))
+    })
+  }
 
   /**
    * Replaces this agent's recurring schedules with the backend's desired state.
