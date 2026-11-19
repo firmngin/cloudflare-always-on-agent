@@ -3,7 +3,9 @@
 # never commit real secrets.
 WORKER_TOKEN=replace_with_fng_aow_token_from_the_firmngin_dashboard
 MODEL_API_KEY=replace_with_your_model_provider_key
-WAKE_SECRET=replace_with_independent_random_32_byte_secret
+# Only two secrets are manual. The backend -> Worker wake signing key is
+# derived from WORKER_TOKEN, so there is nothing to paste here.
+# Existing deployment with an explicit key? Set WAKE_SECRET=... to keep it.
 # Preferred: this Worker's public HTTPS origin only (no path). The runtime
 # derives and reports the exact /v1/wake URL.
 WORKER_BASE_URL=https://your-private-worker-route.example.com

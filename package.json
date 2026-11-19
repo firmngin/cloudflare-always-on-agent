@@ -17,13 +17,10 @@
   "cloudflare": {
     "bindings": {
       "WORKER_TOKEN": {
-        "description": "The `fng_aow_...` workspace token shown once on the Firmngin deploy card (AI Agents → Always-On Agent → Deploy Worker). It authorizes this Worker to your Firmngin workspace."
+        "description": "The `fng_aow_...` workspace token shown once on the Firmngin deploy card (AI Agents → Always-On Agent → Deploy Worker). It authorizes this Worker to your Firmngin workspace, and the runtime derives the realtime wake signing key from it."
       },
       "MODEL_API_KEY": {
         "description": "Your model provider key (OpenRouter, OpenAI, Anthropic, ...). **It stays in Cloudflare** — Firmngin never sees it."
-      },
-      "WAKE_SECRET": {
-        "description": "Independent random secret of at least 32 bytes used only to authenticate Firmngin realtime wake requests. Do not reuse your Worker token or model key."
       },
       "WORKER_BASE_URL": {
         "description": "This Worker's public HTTPS origin only, e.g. `https://worker.example.com` (no path, query, hash or credentials). Provisioned once; the runtime derives and reports the exact `/v1/wake` URL. Preferred for new deployments."

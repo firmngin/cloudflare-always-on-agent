@@ -2,6 +2,36 @@ const encoder = new TextEncoder()
 
 export const WAKE_REPLAY_WINDOW_SECONDS = 300
 
+/**
+ * Domain label for the derived signing key. Fixed and versioned so the key can
+ * never collide with the Worker token's own use (backend authentication) or
+ * with a future derivation, and so a change of purpose is a visible change
+ * here instead of a silent key rotation.
+ */
+export const WAKE_SIGNING_KEY_DOMAIN = 'firmngin/data-agent/wake-signing-key/v1'
+
+/**
+ * The backend -> Worker signing key, derived from the Worker token so a new
+ * deployment has one secret fewer to invent (WORKER_TOKEN + MODEL_API_KEY).
+ * HMAC-SHA-256 keyed by the token with the domain label as the message:
+ * deterministic on every isolate, never equal to the token, and different
+ * after a token rotation (the next handshake re-registers it). Hex output is
+ * 64 bytes, inside the backend's 32-256 byte wake_secret window.
+ */
+export async function deriveWakeSigningKey(workerToken: string): Promise<string> {
+  const token = String(workerToken || '').trim()
+  if (!token) return ''
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(token),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(WAKE_SIGNING_KEY_DOMAIN))
+  return hex(new Uint8Array(mac))
+}
+
 export interface WakeAuthBinding {
   deploymentId: string
   workspaceId: string

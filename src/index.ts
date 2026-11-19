@@ -49,10 +49,15 @@
  * schedulers.
  *
  * Deploy: the Firmngin dashboard "Deploy to Cloudflare" button (this repo), or
- * `npx wrangler deploy` after filling in wrangler.toml and the three secrets:
+ * `npx wrangler deploy` after filling in wrangler.toml and the two secrets:
  *   WORKER_TOKEN   - the workspace Worker token (fng_aow_...)
  *   MODEL_API_KEY  - the model provider key (never sent to Firmngin)
- *   WAKE_SECRET    - the independent backend-to-Worker HMAC key
+ *
+ * The backend -> Worker wake signing key needs no separate secret: unless a
+ * legacy WAKE_SECRET is set explicitly, it is derived from WORKER_TOKEN with a
+ * domain-separated HMAC-SHA-256 (src/runtime/wake-auth.ts) and registered with
+ * Firmngin by the handshake. Realtime wake is opted into with the plain
+ * WORKER_BASE_URL var.
  *
  * URL_BACKEND is a plain var holding the production API base URL. A development
  * deployment overrides it at runtime through ENVIRONMENT="development" plus
@@ -85,7 +90,7 @@ import {
   type TerminalRunReport,
 } from './runtime/turn'
 import { toTerminalReport, type PendingRunReport } from './runtime/pending-report'
-import { verifyWakeSignature, WakeAuthError } from './runtime/wake-auth'
+import { deriveWakeSigningKey, verifyWakeSignature, WakeAuthError } from './runtime/wake-auth'
 import { classifyRuntimeRoute, resolveWakeCallbackUrl, type ResolvedWakeCallback } from './runtime/wake-route'
 import { readBoundedRequestBody, RequestBodyTooLargeError } from './runtime/bounded-body'
 import {
@@ -115,7 +120,11 @@ export interface Env {
   URL_BACKEND_DEV?: string
   WORKER_TOKEN: string
   MODEL_API_KEY: string
-  /** Independently provisioned HMAC key for backend -> Worker wakes. */
+  /**
+   * Legacy override: an explicitly configured backend -> Worker HMAC key.
+   * Existing deployments keep using it; when unset the runtime derives one
+   * from WORKER_TOKEN instead.
+   */
   WAKE_SECRET?: string
   /** Preferred: this Worker's public HTTPS origin, e.g. https://worker.example.com. */
   WORKER_BASE_URL?: string
@@ -146,7 +155,7 @@ export interface Env {
   SUBREQUEST_BUDGET?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.9'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.10'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -1040,10 +1049,13 @@ async function listWorkerAgents(budget: SubrequestBudget): Promise<WorkerAgent[]
  */
 async function handshake(trace: RuntimeTrace, budget: SubrequestBudget): Promise<void> {
   const wake = wakeCallback()
-  const wakeSecret = String(runtimeEnv?.WAKE_SECRET || '').trim()
+  // The same key the wake route verifies with: explicit legacy WAKE_SECRET
+  // first, otherwise derived from WORKER_TOKEN.
+  const wakeSecret = await wakeSigningKey()
+  const wakeConfigured = await isWakeConfigured()
   await traceRegistration(trace, apiUrl, workerToken, 'handshake', {
     runtime_version: WORKER_VERSION, nonce: crypto.randomUUID(),
-    ...(isWakeConfigured() && wake.url ? { wake_url: wake.url, wake_secret: wakeSecret } : {}),
+    ...(wakeConfigured && wake.url ? { wake_url: wake.url, wake_secret: wakeSecret } : {}),
   }, budget)
 }
 
@@ -1068,7 +1080,7 @@ async function replayPendingReport(
 }
 
 async function handleWake(request: Request, budget: SubrequestBudget): Promise<Response> {
-  const secret = String(runtimeEnv?.WAKE_SECRET || '').trim()
+  const secret = await wakeSigningKey()
   const namespace = runtimeEnv?.WORKSPACE_AGENT
   if (!secret || !namespace) {
     return Response.json({ ok: false, error: 'WAKE_NOT_CONFIGURED' }, { status: 503 })
@@ -1366,9 +1378,24 @@ function wakeCallback(): ResolvedWakeCallback {
   })
 }
 
-function isWakeConfigured(): boolean {
-  const wakeSecret = String(runtimeEnv?.WAKE_SECRET || '').trim()
-  const wakeSecretBytes = new TextEncoder().encode(wakeSecret).byteLength
+/**
+ * The single backend -> Worker signing key, used by both the handshake that
+ * registers it and the `/v1/wake` verifier. An explicit WAKE_SECRET wins so an
+ * existing deployment keeps the key Firmngin already stored; otherwise the key
+ * is derived from WORKER_TOKEN (see deriveWakeSigningKey). An explicit secret
+ * outside 32-256 bytes is not silently replaced: it stays fail-closed and the
+ * cron log names it. A wizard placeholder is not a secret, so it falls through
+ * to the derived key.
+ */
+async function wakeSigningKey(): Promise<string> {
+  const explicit = String(runtimeEnv?.WAKE_SECRET || '').trim()
+  if (explicit && !isPlaceholderToken(explicit)) return explicit
+  const token = String(runtimeEnv?.WORKER_TOKEN || '').trim()
+  return isPlaceholderToken(token) ? '' : deriveWakeSigningKey(token)
+}
+
+async function isWakeConfigured(): Promise<boolean> {
+  const wakeSecretBytes = new TextEncoder().encode(await wakeSigningKey()).byteLength
   return wakeSecretBytes >= 32 && wakeSecretBytes <= 256 && Boolean(wakeCallback().url) &&
     Boolean(runtimeEnv?.WORKSPACE_AGENT)
 }
@@ -1396,12 +1423,12 @@ export default {
         String(env.WORKER_BASE_URL || '').trim() || String(env.WAKE_CALLBACK_URL || '').trim() ||
         String(env.WAKE_SECRET || '').trim(),
       )
-      if (hasWakeSettings && !isWakeConfigured()) {
+      if (hasWakeSettings && !(await isWakeConfigured())) {
         // An invalid WORKER_BASE_URL never falls back to WAKE_CALLBACK_URL, so
         // name the missing piece instead of reporting a generic misconfiguration.
         console.error(
           wakeCallback().url
-            ? 'realtime wake is disabled: 32-256 byte WAKE_SECRET and WORKSPACE_AGENT must both be valid'
+            ? 'realtime wake is disabled: the WORKSPACE_AGENT binding is missing, or the explicit WAKE_SECRET is outside 32-256 bytes'
             : 'realtime wake is disabled: WORKER_BASE_URL (or legacy WAKE_CALLBACK_URL) must be a valid HTTPS origin; an invalid WORKER_BASE_URL does not fall back',
         )
       }
@@ -1453,7 +1480,7 @@ export default {
       return Response.json({ ok: false, error: 'NOT_FOUND' }, { status: 404 })
     }
     const baseConfigured = isBaseConfigured()
-    const wakeConfigured = isWakeConfigured()
+    const wakeConfigured = await isWakeConfigured()
     const wake = wakeCallback()
     if (route === 'wake') {
       if (!baseConfigured || !wakeConfigured) {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { classifyRuntimeRoute, resolveWakeCallbackUrl } from '../src/runtime/wake-route.ts'
-import { verifyWakeSignature } from '../src/runtime/wake-auth.ts'
+import { deriveWakeSigningKey, verifyWakeSignature, WAKE_SIGNING_KEY_DOMAIN } from '../src/runtime/wake-auth.ts'
 import { authorizeWakeState, completeWakeState, releaseWakeState } from '../src/runtime/wake-security.ts'
 import { readBoundedRequestBody, RequestBodyTooLargeError } from '../src/runtime/bounded-body.ts'
 import { scheduleSyncOwnsAgent } from '../src/runtime/schedule-ownership.ts'
@@ -130,7 +130,31 @@ test('wake callback prefers WORKER_BASE_URL and fails closed when it is invalid'
   }
 })
 
-async function signedWakeRequest(body: Uint8Array, timestamp: number): Promise<Request> {
+test('wake signing key is derived from the worker token, never the token itself', async () => {
+  const token = 'fng_aow_0123456789abcdef'
+  const derived = await deriveWakeSigningKey(token)
+
+  // Pinned regression vector (domain label + HMAC-SHA-256 under the token),
+  // computed independently with openssl. Changing it rotates every derived key.
+  assert.equal(WAKE_SIGNING_KEY_DOMAIN, 'firmngin/data-agent/wake-signing-key/v1')
+  assert.equal(derived, '47ec13b97cd0dd3c1e4523ea326b1c902011b68cbb31089b76048ac89ee363ae')
+  assert.equal(derived, await deriveWakeSigningKey(`  ${token}  `))
+  assert.equal(await deriveWakeSigningKey('   '), '')
+  assert.notEqual(derived, token)
+  assert.notEqual(derived, await deriveWakeSigningKey('fng_aow_rotated0123456789'))
+  const derivedBytes = new TextEncoder().encode(derived).byteLength
+  assert.ok(derivedBytes >= 32 && derivedBytes <= 256)
+
+  // The derived key is the wake key; the raw token authenticates the other
+  // direction and must not verify a wake.
+  const now = 1_795_000_000
+  const body = new TextEncoder().encode('{"event_id":"event"}')
+  const request = await signedWakeRequest(body, now, derived)
+  await verifyWakeSignature(request, body, derived, now)
+  await assert.rejects(verifyWakeSignature(request, body, token, now), /signature is invalid/)
+})
+
+async function signedWakeRequest(body: Uint8Array, timestamp: number, signingKey = secret): Promise<Request> {
   const nonce = 'nonce-signature-123456'
   const bodyHash = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', body)))
   const canonical = [
@@ -144,7 +168,7 @@ async function signedWakeRequest(body: Uint8Array, timestamp: number): Promise<R
   ].join('\n')
   const key = await crypto.subtle.importKey(
     'raw',
-    new TextEncoder().encode(secret),
+    new TextEncoder().encode(signingKey),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign'],
