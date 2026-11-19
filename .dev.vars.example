@@ -4,4 +4,9 @@
 WORKER_TOKEN=replace_with_fng_aow_token_from_the_firmngin_dashboard
 MODEL_API_KEY=replace_with_your_model_provider_key
 WAKE_SECRET=replace_with_independent_random_32_byte_secret
-WAKE_CALLBACK_URL=https://your-private-worker-route.example.com/v1/wake
+# Preferred: this Worker's public HTTPS origin only (no path). The runtime
+# derives and reports the exact /v1/wake URL.
+WORKER_BASE_URL=https://your-private-worker-route.example.com
+# Legacy fallback, used only when WORKER_BASE_URL is absent: the full URL
+# ending in /v1/wake.
+# WAKE_CALLBACK_URL=https://your-private-worker-route.example.com/v1/wake

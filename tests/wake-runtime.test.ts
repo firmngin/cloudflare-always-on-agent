@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { classifyRuntimeRoute } from '../src/runtime/wake-route.ts'
+import { classifyRuntimeRoute, resolveWakeCallbackUrl } from '../src/runtime/wake-route.ts'
 import { verifyWakeSignature } from '../src/runtime/wake-auth.ts'
 import { authorizeWakeState, completeWakeState, releaseWakeState } from '../src/runtime/wake-security.ts'
 import { readBoundedRequestBody, RequestBodyTooLargeError } from '../src/runtime/bounded-body.ts'
@@ -98,6 +98,36 @@ test('wake request body is bounded while streaming', async () => {
 test('successful empty schedule sync disables legacy scheduling', () => {
   assert.equal(scheduleSyncOwnsAgent([]), true)
   assert.equal(scheduleSyncOwnsAgent(null), false)
+})
+
+test('wake callback prefers WORKER_BASE_URL and fails closed when it is invalid', () => {
+  // New provisioning: one origin, exact /v1/wake derived from it.
+  assert.deepEqual(resolveWakeCallbackUrl({ baseUrl: 'https://worker.example.com' }), {
+    url: 'https://worker.example.com/v1/wake', source: 'worker_base_url',
+  })
+  assert.deepEqual(resolveWakeCallbackUrl({ baseUrl: 'https://worker.example.com/' }), {
+    url: 'https://worker.example.com/v1/wake', source: 'worker_base_url',
+  })
+  // Legacy fallback stays byte-for-byte the old rule.
+  assert.deepEqual(resolveWakeCallbackUrl({ baseUrl: '   ', callbackUrl: 'https://old.example.com/v1/wake' }), {
+    url: 'https://old.example.com/v1/wake', source: 'wake_callback_url',
+  })
+  // Both configured: the base wins, the stale callback is ignored.
+  assert.deepEqual(
+    resolveWakeCallbackUrl({ baseUrl: 'https://new.example.com', callbackUrl: 'https://old.example.com/v1/wake' }),
+    { url: 'https://new.example.com/v1/wake', source: 'worker_base_url' },
+  )
+  for (const invalid of [
+    'http://worker.example.com', 'https://worker.example.com/v1/wake', 'https://worker.example.com/a/..',
+    'https://worker.example.com/%2e%2e', 'https://worker.example.com/x/?q=1', 'https://worker.example.com/#f',
+    'https://user:pass@worker.example.com', 'not-a-url',
+  ]) {
+    assert.deepEqual(
+      resolveWakeCallbackUrl({ baseUrl: invalid, callbackUrl: 'https://old.example.com/v1/wake' }),
+      { url: null, source: null },
+      invalid,
+    )
+  }
 })
 
 async function signedWakeRequest(body: Uint8Array, timestamp: number): Promise<Request> {

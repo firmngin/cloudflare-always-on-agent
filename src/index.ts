@@ -86,7 +86,7 @@ import {
 } from './runtime/turn'
 import { toTerminalReport, type PendingRunReport } from './runtime/pending-report'
 import { verifyWakeSignature, WakeAuthError } from './runtime/wake-auth'
-import { classifyRuntimeRoute } from './runtime/wake-route'
+import { classifyRuntimeRoute, resolveWakeCallbackUrl, type ResolvedWakeCallback } from './runtime/wake-route'
 import { readBoundedRequestBody, RequestBodyTooLargeError } from './runtime/bounded-body'
 import {
   createSubrequestBudget,
@@ -117,7 +117,9 @@ export interface Env {
   MODEL_API_KEY: string
   /** Independently provisioned HMAC key for backend -> Worker wakes. */
   WAKE_SECRET?: string
-  /** Explicit public HTTPS route ending in /v1/wake. */
+  /** Preferred: this Worker's public HTTPS origin, e.g. https://worker.example.com. */
+  WORKER_BASE_URL?: string
+  /** Legacy: the full public HTTPS route ending in /v1/wake. */
   WAKE_CALLBACK_URL?: string
   MODEL_BASE_URL?: string
   /** Output cap for providers that require it (Anthropic Messages). */
@@ -144,7 +146,7 @@ export interface Env {
   SUBREQUEST_BUDGET?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.8'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.9'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -1037,11 +1039,11 @@ async function listWorkerAgents(budget: SubrequestBudget): Promise<WorkerAgent[]
  * authentication.
  */
 async function handshake(trace: RuntimeTrace, budget: SubrequestBudget): Promise<void> {
-  const wakeURL = String(runtimeEnv?.WAKE_CALLBACK_URL || '').trim()
+  const wake = wakeCallback()
   const wakeSecret = String(runtimeEnv?.WAKE_SECRET || '').trim()
   await traceRegistration(trace, apiUrl, workerToken, 'handshake', {
     runtime_version: WORKER_VERSION, nonce: crypto.randomUUID(),
-    ...(isWakeConfigured() ? { wake_url: wakeURL, wake_secret: wakeSecret } : {}),
+    ...(isWakeConfigured() && wake.url ? { wake_url: wake.url, wake_secret: wakeSecret } : {}),
   }, budget)
 }
 
@@ -1356,19 +1358,18 @@ function isBaseConfigured(): boolean {
     Boolean(String(runtimeEnv?.MODEL_API_KEY || '').trim())
 }
 
+/** One resolver for handshake, config gates, and the diagnostic surface. */
+function wakeCallback(): ResolvedWakeCallback {
+  return resolveWakeCallbackUrl({
+    baseUrl: runtimeEnv?.WORKER_BASE_URL,
+    callbackUrl: runtimeEnv?.WAKE_CALLBACK_URL,
+  })
+}
+
 function isWakeConfigured(): boolean {
-  const wakeURL = String(runtimeEnv?.WAKE_CALLBACK_URL || '').trim()
   const wakeSecret = String(runtimeEnv?.WAKE_SECRET || '').trim()
   const wakeSecretBytes = new TextEncoder().encode(wakeSecret).byteLength
-  let validWakeURL = false
-  try {
-    const parsed = new URL(wakeURL)
-    validWakeURL = parsed.protocol === 'https:' && parsed.pathname === '/v1/wake' &&
-      !parsed.search && !parsed.hash && !parsed.username && !parsed.password
-  } catch {
-    validWakeURL = false
-  }
-  return wakeSecretBytes >= 32 && wakeSecretBytes <= 256 && validWakeURL &&
+  return wakeSecretBytes >= 32 && wakeSecretBytes <= 256 && Boolean(wakeCallback().url) &&
     Boolean(runtimeEnv?.WORKSPACE_AGENT)
 }
 export default {
@@ -1391,9 +1392,18 @@ export default {
       // Registration is best-effort during a staged rollout. The public wake
       // route itself stays fail-closed, while existing outbound cron recovery
       // continues if callback settings are absent or the handshake is down.
-      const hasWakeSettings = Boolean(String(env.WAKE_CALLBACK_URL || '').trim() || String(env.WAKE_SECRET || '').trim())
+      const hasWakeSettings = Boolean(
+        String(env.WORKER_BASE_URL || '').trim() || String(env.WAKE_CALLBACK_URL || '').trim() ||
+        String(env.WAKE_SECRET || '').trim(),
+      )
       if (hasWakeSettings && !isWakeConfigured()) {
-        console.error('realtime wake is disabled: WAKE_CALLBACK_URL, 32-256 byte WAKE_SECRET, and WORKSPACE_AGENT must all be valid')
+        // An invalid WORKER_BASE_URL never falls back to WAKE_CALLBACK_URL, so
+        // name the missing piece instead of reporting a generic misconfiguration.
+        console.error(
+          wakeCallback().url
+            ? 'realtime wake is disabled: 32-256 byte WAKE_SECRET and WORKSPACE_AGENT must both be valid'
+            : 'realtime wake is disabled: WORKER_BASE_URL (or legacy WAKE_CALLBACK_URL) must be a valid HTTPS origin; an invalid WORKER_BASE_URL does not fall back',
+        )
       }
       try {
         await handshake(trace, budget)
@@ -1444,6 +1454,7 @@ export default {
     }
     const baseConfigured = isBaseConfigured()
     const wakeConfigured = isWakeConfigured()
+    const wake = wakeCallback()
     if (route === 'wake') {
       if (!baseConfigured || !wakeConfigured) {
         logRuntimeTrace(trace, 'runtime.configuration.invalid', {}, true)
@@ -1464,6 +1475,7 @@ export default {
       token_configured: !isPlaceholderToken(workerToken),
       configured: baseConfigured,
       wake_configured: wakeConfigured,
+      wake_url_source: wake.source,
     })
   },
 }

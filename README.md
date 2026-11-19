@@ -23,13 +23,15 @@ click **Deploy to Cloudflare**. The wizard asks for:
 | `WORKER_TOKEN` (secret) | the workspace Worker token (`fng_aow_...`) — shown once next to the deploy button |
 | `MODEL_API_KEY` (secret) | your model provider key (OpenRouter, OpenAI, ...) |
 | `WAKE_SECRET` (secret) | an independent random secret of at least 32 bytes |
-| `WAKE_CALLBACK_URL` (variable) | an explicit HTTPS custom route ending exactly in `/v1/wake` |
+| `WORKER_BASE_URL` (variable) | this Worker's public HTTPS origin, e.g. `https://worker.example.com` — no path |
+| `WAKE_CALLBACK_URL` (variable, legacy) | the full HTTPS route ending exactly in `/v1/wake`; used only when `WORKER_BASE_URL` is absent |
 
 There is no agent id and no agent form: the Worker is workspace-level.
 
 The Worker deploys with a once-a-minute recovery cron. Realtime provisioning is
-not complete until the custom route, `WAKE_CALLBACK_URL`, and `WAKE_SECRET`
-exist and the authenticated handshake succeeds. The public wake route remains
+not complete until the custom route, a wake URL (`WORKER_BASE_URL` for new
+deployments, `WAKE_CALLBACK_URL` for existing ones), and `WAKE_SECRET` exist and
+the authenticated handshake succeeds. The public wake route remains
 fail-closed before that point, while existing outbound cron recovery continues.
 Firmngin then calls only signed `POST /v1/wake` for realtime work. For recovery,
 each cron invocation keeps long-polling the inbox
@@ -54,8 +56,10 @@ npm install
 npx wrangler secret put WORKER_TOKEN
 npx wrangler secret put MODEL_API_KEY
 npx wrangler secret put WAKE_SECRET
-# Create the HTTPS custom route, then set its exact /v1/wake URL as
-# WAKE_CALLBACK_URL in the Worker variables to enable realtime wake.
+# Create the HTTPS custom route, then set the Worker's public origin as
+# WORKER_BASE_URL in the Worker variables to enable realtime wake (the runtime
+# derives /v1/wake itself). Existing deployments may keep the legacy
+# WAKE_CALLBACK_URL=<origin>/v1/wake instead.
 npx wrangler deploy
 ```
 
@@ -129,17 +133,33 @@ declared in `wrangler.toml`; `npm install` pulls `agents@0.33.0`
 `firmnginbe/docs/architecture/data-agent-durable-objects.md` for the contract.
 
 The repository deliberately contains no guessed public callback URL. Until
-provisioning supplies a custom route plus `WAKE_CALLBACK_URL` and
-`WAKE_SECRET`, `POST /v1/wake` returns `503`; the existing outbound cron and
-bounded long-poll remain available as staged-rollout recovery.
+provisioning supplies a custom route plus `WORKER_BASE_URL` (or the legacy
+`WAKE_CALLBACK_URL`) and `WAKE_SECRET`, `POST /v1/wake` returns `503`; the
+existing outbound cron and bounded long-poll remain available as staged-rollout
+recovery.
 
 ## Pairing and runtime config
 
 On each cron recovery invocation, the Worker sends an authenticated outbound
-`POST /handshake`. Once both wake settings are valid it includes the exact wake
-URL and reverse secret; Firmngin encrypts the secret at rest and never returns
-it. Missing or partially staged wake settings do not stop the existing cron
-fallback, but the inbound wake route remains disabled.
+`POST /handshake`. Once the wake settings are valid it includes the resolved
+full `wake_url` and reverse secret; Firmngin encrypts the secret at rest and
+never returns it. Missing or partially staged wake settings do not stop the
+existing cron fallback, but the inbound wake route remains disabled.
+
+Wake URL resolution has exactly one rule (`src/runtime/wake-route.ts`), shared
+by the handshake, the config gates, and the `GET /` diagnostic:
+
+- `WORKER_BASE_URL` set and valid — a bare HTTPS origin, optional trailing
+  slash, no path/query/hash/credentials. The reported URL is
+  `<origin>/v1/wake`. It is authoritative, so a stale legacy value is ignored.
+- `WORKER_BASE_URL` set but invalid — fail closed: waking stays disabled and
+  the runtime logs the cause. It never silently reuses `WAKE_CALLBACK_URL`.
+- `WORKER_BASE_URL` absent or blank — fall back to a valid legacy
+  `WAKE_CALLBACK_URL` (HTTPS, path exactly `/v1/wake`).
+
+The handshake payload, signed path, `WAKE_SECRET`, the Durable Object binding
+and the backend contract are unchanged; only the local source of the URL
+differs. `wake_url_source` in the `GET /` response reports which one won.
 Its agent roster comes from `GET /deployment/config`, which is scoped to the
 Worker token and carries the workspace id needed for the Durable Object name.
 Both outbound routes use the worker token. The reverse direction is limited to

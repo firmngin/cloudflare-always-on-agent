@@ -10,10 +10,11 @@ compatibility_flags = ["nodejs_compat", "enable_request_signal"]
 workers_dev = false
 preview_urls = false
 
-# Runs once a minute as recovery and heartbeat. When WAKE_CALLBACK_URL and
-# WAKE_SECRET are registered, Firmngin dispatches queued turns immediately;
-# cron long-poll catches a missed or unavailable callback without becoming a
-# second scheduler. Legacy scheduled runs remain hour-bucket idempotent.
+# Runs once a minute as recovery and heartbeat. When a wake URL
+# (WORKER_BASE_URL) and WAKE_SECRET are registered, Firmngin dispatches queued
+# turns immediately; cron long-poll catches a missed or unavailable callback
+# without becoming a second scheduler. Legacy scheduled runs remain hour-bucket
+# idempotent.
 [triggers]
 crons = ["* * * * *"]
 
@@ -82,10 +83,16 @@ AGENT_DO_SYNC = "false"
 #   MODEL_API_KEY - your model provider key; never sent to Firmngin.
 #   WAKE_SECRET   - an independent random secret (32+ bytes) shared only with
 #                   Firmngin through the authenticated handshake.
-# Realtime var, set after provisioning the HTTPS custom route. The inbound wake
-# route is fail-closed until this exact URL and WAKE_SECRET are present; cron
-# recovery remains available during staged rollout:
-#   WAKE_CALLBACK_URL - exact public URL ending in /v1/wake.
+# Realtime var, set once after provisioning the HTTPS custom route. The inbound
+# wake route is fail-closed until a valid wake URL and WAKE_SECRET are present;
+# cron recovery remains available during staged rollout:
+#   WORKER_BASE_URL   - this Worker's public HTTPS origin, e.g.
+#                       https://worker.example.com . Preferred for new
+#                       provisioning: one origin, and the runtime derives and
+#                       reports the exact /v1/wake URL at handshake time.
+#   WAKE_CALLBACK_URL - legacy full URL ending in /v1/wake. Used only when
+#                       WORKER_BASE_URL is absent or blank; an invalid
+#                       WORKER_BASE_URL fails closed instead of falling back.
 
 # Persist correlated registration diagnostics in Cloudflare Workers Logs.
 [observability]

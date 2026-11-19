@@ -25,8 +25,11 @@
       "WAKE_SECRET": {
         "description": "Independent random secret of at least 32 bytes used only to authenticate Firmngin realtime wake requests. Do not reuse your Worker token or model key."
       },
+      "WORKER_BASE_URL": {
+        "description": "This Worker's public HTTPS origin only, e.g. `https://worker.example.com` (no path, query, hash or credentials). Provisioned once; the runtime derives and reports the exact `/v1/wake` URL. Preferred for new deployments."
+      },
       "WAKE_CALLBACK_URL": {
-      "description": "Public HTTPS custom-route URL ending exactly in `/v1/wake`. Provision the route first; realtime ingress stays fail-closed until this value is registered while cron recovery remains available."
+        "description": "Legacy: full public HTTPS URL ending exactly in `/v1/wake`. Used only when `WORKER_BASE_URL` is absent; leave empty for new deployments."
       },
       "URL_BACKEND": {
         "description": "Firmngin API base URL. Leave the committed default unless the deploy card tells you otherwise."
