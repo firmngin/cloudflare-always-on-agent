@@ -35,6 +35,17 @@ export interface TerminalRunReport {
   output?: string
   error_code?: string
   error_message?: string
+  /** True only when MAX_STEPS ended the turn; false on any other outcome. */
+  tool_loop_hit?: boolean
+}
+
+/**
+ * What an engine turn returns: its final content and whether the step guard
+ * (`MAX_STEPS`) ended it while it still wanted another assistant turn.
+ */
+export interface TurnOutput {
+  content: string
+  toolLoopHit: boolean
 }
 
 /**

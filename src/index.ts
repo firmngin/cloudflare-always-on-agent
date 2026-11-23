@@ -89,6 +89,7 @@ import {
   INTERACTIVE_LANE,
   type RunReportOutcome,
   type TerminalRunReport,
+  type TurnOutput,
 } from './runtime/turn'
 import { toTerminalReport, type PendingRunReport } from './runtime/pending-report'
 import { deriveWakeSigningKey, verifyWakeSignature, WakeAuthError } from './runtime/wake-auth'
@@ -156,7 +157,7 @@ export interface Env {
   SUBREQUEST_BUDGET?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.11'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.12'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -818,13 +819,18 @@ async function runTurn(
   const timeout = setTimeout(() => controller.abort(new Error('Turn exceeded the time budget')), TURN_TIMEOUT_MS)
   try {
     await events.pushAndFlush('message.start', '', controller.signal)
-    const output = agentEngine === 'builtin'
+    const turn = agentEngine === 'builtin'
       ? await executeTurnBuiltin(budget, agentId, claim, events, controller.signal)
       : await executeTurnPi(agentId, claim, events, piEngineDeps(budget), controller.signal)
     // The final batch spends this run's optional terminal slot, the report its
     // reserved PATCH slot: a completed answer lands even when streaming ran out.
-    await events.pushAndFlush('message.final', output, controller.signal, 'terminal')
-    const report: TerminalRunReport = { status: 'succeeded', content: output, output }
+    await events.pushAndFlush('message.final', turn.content, controller.signal, 'terminal')
+    const report: TerminalRunReport = {
+      status: 'succeeded',
+      content: turn.content,
+      output: turn.content,
+      tool_loop_hit: turn.toolLoopHit,
+    }
     const outcome = await finishRun(budget, reservation, agentId, claim.run_id, report, controller.signal)
     if (outcome === 'delivered') {
       console.log(`run ${claim.run_id} succeeded in ${Date.now() - started}ms`)
@@ -846,7 +852,7 @@ async function runTurn(
     const code = error instanceof ApiError && error.errorCode ? error.errorCode : 'WORKER_ERROR'
     console.error(`run ${claim.run_id} failed:`, message)
     await events.pushAndFlush('error', message, undefined, 'terminal').catch(() => {})
-    const report: TerminalRunReport = { status: 'failed', error_code: code, error_message: message }
+    const report: TerminalRunReport = { status: 'failed', error_code: code, error_message: message, tool_loop_hit: false }
     const outcome = await finishRun(budget, reservation, agentId, claim.run_id, report)
     if (outcome !== 'delivered') {
       console.warn({
@@ -877,7 +883,7 @@ async function executeTurnBuiltin(
   claim: Claim,
   events: EventStream,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<TurnOutput> {
   const model = claim.model
   if (!model) throw new ApiError(0, 'Agent config has no model', 'CONFIG_INVALID')
   const protocol = resolveModelProtocol(claim)
@@ -911,6 +917,7 @@ async function executeTurnBuiltin(
 
   const maxSteps = Math.max(1, Number(maxStepsEnv || 8))
   let finalContent = ''
+  let toolLoopHit = false
   for (let step = 0; step < maxSteps; step++) {
     const result = await callModel(budget, model, messages, tools, async (text) => {
       await events.pushDelta(text, signal)
@@ -945,10 +952,12 @@ async function executeTurnBuiltin(
       messages.push({ role: 'tool', tool_call_id: call.id || `call_${step}_${call.name}`, content: toolOutput })
     }
     finalContent = ''
+    // Only a tool-calling last allowed step means the guard ended the loop.
+    toolLoopHit = step + 1 >= maxSteps
   }
 
   await events.flush('bestEffort', signal)
-  return finalContent
+  return { content: finalContent, toolLoopHit }
 }
 
 /**

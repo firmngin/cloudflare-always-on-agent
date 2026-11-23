@@ -2,7 +2,8 @@
  * pi-core turn engine.
  *
  * executeTurnPi() mirrors the builtin executeTurn signature/behavior
- * (agentId, claim, events -> final content string) but runs pi's agent loop
+ * (agentId, claim, events -> final content + whether MAX_STEPS ended it) but
+ * runs pi's agent loop
  * (runAgentLoop from @earendil-works/pi-agent-core) with:
  *   - context   : claim history (user/assistant turns) + the task prompt
  *                 (with the skills index appended) + the user message
@@ -41,7 +42,7 @@ import {
   type UserMessage,
 } from '@earendil-works/pi-ai'
 import type { Claim, EventStream, McpClient } from '../index'
-import { shouldConnectMcp } from '../runtime/turn'
+import { shouldConnectMcp, type TurnOutput } from '../runtime/turn'
 import type { SubrequestBudget } from '../runtime/subrequest-budget'
 import { ApiError, createStreamFn, resolveModelProtocol, type ModelProtocol } from './stream-fn'
 import { mapMcpTools, summarize } from './tools'
@@ -56,7 +57,7 @@ export interface PiEngineDeps {
   budget: SubrequestBudget
 }
 
-export async function executeTurnPi(agentId: string, claim: Claim, events: EventStream, deps: PiEngineDeps, signal?: AbortSignal): Promise<string> {
+export async function executeTurnPi(agentId: string, claim: Claim, events: EventStream, deps: PiEngineDeps, signal?: AbortSignal): Promise<TurnOutput> {
   const model = claim.model
   if (!model) throw new ApiError(0, 'Agent config has no model', 'CONFIG_INVALID')
   const protocol = resolveModelProtocol(claim)
@@ -122,6 +123,7 @@ export async function executeTurnPi(agentId: string, claim: Claim, events: Event
   // an unbounded loop (the builtin's NaN case runs zero steps).
   const maxSteps = Number.isFinite(deps.maxSteps) && deps.maxSteps >= 1 ? Math.floor(deps.maxSteps) : 1
   let assistantTurns = 0
+  let toolLoopHit = false
   let finalContent = ''
   let finalAssistant: AssistantMessage | undefined
 
@@ -141,16 +143,22 @@ export async function executeTurnPi(agentId: string, claim: Claim, events: Event
       assistantTurns++
       const message = turn.message as AssistantMessage
       finalAssistant = message
+      const usedTools = message.content.some((block) => block.type === 'toolCall')
       // Same final-content rule as the builtin step loop: a turn that made
       // tool calls resets the final output to ''; a tool-less turn's text
       // becomes it.
-      if (message.content.some((block) => block.type === 'toolCall')) {
+      if (usedTools) {
         finalContent = ''
       } else {
         const text = contentText(message.content)
         if (text) finalContent = text
       }
-      if (assistantTurns >= maxSteps) return { action: 'end' }
+      if (assistantTurns >= maxSteps) {
+        // The guard only ended this turn when the loop still wanted another
+        // one (a tool call); a tool-less final turn ends it either way.
+        toolLoopHit = usedTools
+        return { action: 'end' }
+      }
     },
   }
 
@@ -173,7 +181,7 @@ export async function executeTurnPi(agentId: string, claim: Claim, events: Event
     throw turnFailure(finalAssistant)
   }
   await events.flush('bestEffort', signal)
-  return finalContent
+  return { content: finalContent, toolLoopHit }
 }
 
 /** pi AgentEvent -> runtime EventStream events, with unchanged payload shapes and names. */

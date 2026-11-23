@@ -34,7 +34,7 @@ test('pi turn streams deltas, runs the read-only tool once, and reports an accep
     // Claim -> terminal report: the backend acknowledged the run exactly once.
     assert.equal(mock.patches.length, 1, 'one terminal run report')
     assert.equal(mock.patches[0].status, 200)
-    assert.deepEqual(mock.patches[0].body, { status: 'succeeded', content: ANSWER, output: ANSWER })
+    assert.deepEqual(mock.patches[0].body, { status: 'succeeded', content: ANSWER, output: ANSWER, tool_loop_hit: false })
 
     // The tool ran exactly once: no double execution across the official loop.
     assert.deepEqual(mock.toolCalls, ['list_devices'])
@@ -117,5 +117,23 @@ test('the builtin engine returns the same answer and events for the same claim',
     }
   }
   assert.deepEqual(runs[0], runs[1], 'builtin remains a like-for-like rollback')
-  assert.deepEqual(runs[0].report, { status: 'succeeded', content: ANSWER, output: ANSWER })
+  assert.deepEqual(runs[0].report, { status: 'succeeded', content: ANSWER, output: ANSWER, tool_loop_hit: false })
+})
+
+test('a turn the step guard ends reports tool_loop_hit', async () => {
+  // MAX_STEPS is 8 in the harness and every allowed turn still asks for a tool,
+  // so only the guard can end the loop.
+  const completions = Array.from({ length: 8 }, (_, index) =>
+    completionToolCall(`call_guard_${index}`, 'list_devices', { limit: 5 }))
+  for (const engine of ['pi', 'builtin'] as const) {
+    const mock = installMockBackend({ engine, completions })
+    try {
+      await runScheduled(mock.env)
+      assert.equal(mock.patches.length, 1)
+      assert.equal(mock.patches[0].body.tool_loop_hit, true, `${engine} engine reports the guard`)
+      assert.equal(mock.toolCalls.length, 8, 'every allowed step ran')
+    } finally {
+      mock.restore()
+    }
+  }
 })

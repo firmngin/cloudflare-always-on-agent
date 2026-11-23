@@ -38,6 +38,7 @@ test('an unacknowledged report is kept and replayed instead of re-running the tu
   assert.deepEqual(JSON.parse(JSON.stringify(toTerminalReport(pending))), {
     status: 'succeeded',
     content: 'the paid answer',
+    tool_loop_hit: false,
   })
   assert.equal(pendingReportFor(recorded, 'another-run', now), null)
 })
@@ -55,7 +56,23 @@ test('a failed report keeps its code and message for the replay', () => {
     status: 'failed',
     error_code: 'WORKER_ERROR',
     error_message: 'turn failed',
+    tool_loop_hit: false,
   })
+})
+
+test('a replayed report keeps the step-guard flag it was recorded with', () => {
+  const now = 1_795_000_000_000
+  const recorded = recordPendingReportState(undefined, 'run-guarded', {
+    status: 'succeeded',
+    content: 'stopped by MAX_STEPS',
+    tool_loop_hit: true,
+  }, now)
+
+  const pending = requirePending(pendingReportFor(recorded, 'run-guarded', now))
+  // Replay sends the stored value, never a recomputed one: the turn is gone.
+  const replayed = JSON.parse(JSON.stringify(toTerminalReport(pending)))
+  assert.deepEqual(replayed, { status: 'succeeded', content: 'stopped by MAX_STEPS', tool_loop_hit: true })
+  assert.equal(typeof replayed.tool_loop_hit, 'boolean')
 })
 
 test('a fenced report is dropped once the backend reaper owns the run', () => {
@@ -81,7 +98,7 @@ test('an oversized answer keeps only its status so the value stays storable', ()
   const recorded = recordPendingReportState(undefined, 'run-6', { status: 'succeeded', content: huge }, now)
   const pending = requirePending(pendingReportFor(recorded, 'run-6', now))
   // The backend falls back to the streamed final event when no content arrives.
-  assert.deepEqual(JSON.parse(JSON.stringify(toTerminalReport(pending))), { status: 'succeeded' })
+  assert.deepEqual(JSON.parse(JSON.stringify(toTerminalReport(pending))), { status: 'succeeded', tool_loop_hit: false })
 })
 
 test('pending fences are bounded to the newest runs', () => {

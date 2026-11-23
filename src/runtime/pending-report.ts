@@ -61,6 +61,8 @@ export function recordPendingReportState(
     content: content && utf8Length(content) <= MAX_PENDING_CONTENT_BYTES ? content : undefined,
     error_code: report.error_code || undefined,
     error_message: report.error_message || undefined,
+    // Stored, never recomputed: the replay must PATCH the same value.
+    tool_loop_hit: report.tool_loop_hit === true,
     recorded_at: now,
   }
   return { reports: boundReports(reports) }
@@ -83,6 +85,7 @@ export function toTerminalReport(pending: PendingRunReport): TerminalRunReport {
     content: pending.content || undefined,
     error_code: pending.error_code || undefined,
     error_message: pending.error_message || undefined,
+    tool_loop_hit: pending.tool_loop_hit === true,
   }
 }
 
