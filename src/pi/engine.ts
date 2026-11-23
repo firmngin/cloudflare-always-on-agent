@@ -48,6 +48,10 @@ import { ApiError, createStreamFn, resolveModelProtocol, type ModelProtocol } fr
 import { mapMcpTools, summarize } from './tools'
 import { createLoadSkillTool, parseSkills, renderSkillsIndex } from './skills'
 
+// Reasoning text is forwarded for the dashboard timeline, but it never earns a
+// bigger event payload than this.
+const THINKING_TEXT_LIMIT = 8000
+
 export interface PiEngineDeps {
   /** The template's MCP token exchange + client connect (src/index.ts). */
   connectMcp(agentId: string, signal?: AbortSignal): Promise<McpClient | null>
@@ -186,9 +190,37 @@ export async function executeTurnPi(agentId: string, claim: Claim, events: Event
 
 /** pi AgentEvent -> runtime EventStream events, with unchanged payload shapes and names. */
 function mapAgentEvents(events: EventStream, signal?: AbortSignal): AgentEventSink {
+  // One reasoning block per model call: the dashboard places it on the timeline
+  // by the offset recorded when it started, so the text travels with the stop.
+  let thinkingStartedAt = 0
+  let thinkingText = ''
   return async (event) => {
-    if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
-      await events.pushDelta(event.assistantMessageEvent.delta, signal)
+    if (event.type === 'message_update') {
+      const update = event.assistantMessageEvent
+      if (update.type === 'text_delta') {
+        await events.pushDelta(update.delta, signal)
+        return
+      }
+      if (update.type === 'thinking_start') {
+        thinkingStartedAt = Date.now()
+        thinkingText = ''
+        await events.pushAndFlush('thinking.start', '', signal)
+        return
+      }
+      if (update.type === 'thinking_delta') {
+        if (thinkingText.length < THINKING_TEXT_LIMIT) thinkingText += update.delta
+        return
+      }
+      if (update.type === 'thinking_end') {
+        const duration = thinkingStartedAt > 0 ? Date.now() - thinkingStartedAt : 0
+        thinkingStartedAt = 0
+        await events.pushAndFlush(
+          'thinking.stop',
+          JSON.stringify({ duration_ms: duration, content: thinkingText.slice(0, THINKING_TEXT_LIMIT) }),
+          signal,
+        )
+        thinkingText = ''
+      }
       return
     }
     if (event.type === 'tool_execution_start') {
