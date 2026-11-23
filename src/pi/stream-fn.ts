@@ -33,6 +33,7 @@ import {
 	type Model,
 	type StopReason,
 	type TextContent,
+	type ThinkingContent,
 	type ToolCall,
 	type TranscriptContext,
 	type Usage,
@@ -150,11 +151,14 @@ export async function callModel(
   protocol: ModelProtocol = 'openai',
   signal?: AbortSignal,
   runId?: string,
+  // Provider reasoning deltas (DeepSeek/OpenRouter `reasoning`, Anthropic
+  // `thinking_delta`). Optional: a provider that does not reason never calls it.
+  onReasoning?: (text: string) => Promise<void>,
 ): Promise<ModelTurnResult> {
   if (protocol === 'anthropic') {
-    return callAnthropicModel(budget, model, messages, tools, onDelta, baseUrlOverride, signal, runId)
+    return callAnthropicModel(budget, model, messages, tools, onDelta, baseUrlOverride, signal, runId, onReasoning)
   }
-  return callOpenAIModel(budget, model, messages, tools, onDelta, baseUrlOverride, signal, runId)
+  return callOpenAIModel(budget, model, messages, tools, onDelta, baseUrlOverride, signal, runId, onReasoning)
 }
 
 async function callOpenAIModel(
@@ -166,6 +170,7 @@ async function callOpenAIModel(
   baseUrlOverride?: string,
   signal?: AbortSignal,
   runId?: string,
+  onReasoning?: (text: string) => Promise<void>,
 ): Promise<ModelTurnResult> {
   const base = trimSlash(baseUrlOverride || modelBase || 'https://openrouter.ai/api/v1')
   const body: Record<string, unknown> = { model, messages, stream: true }
@@ -220,6 +225,12 @@ async function callOpenAIModel(
       }
       content += delta.content
       await onDelta(delta.content)
+    }
+    // Reasoning models stream their thinking on a side channel that never
+    // reaches `content`; forward it only when the caller asked for it.
+    const reasoning = delta.reasoning_content ?? delta.reasoning
+    if (onReasoning && typeof reasoning === 'string' && reasoning.length) {
+      await onReasoning(reasoning)
     }
     for (const call of delta.tool_calls || []) {
       const index = Number(call.index ?? 0)
@@ -316,6 +327,7 @@ async function callAnthropicModel(
   baseUrlOverride?: string,
   signal?: AbortSignal,
   runId?: string,
+  onReasoning?: (text: string) => Promise<void>,
 ): Promise<ModelTurnResult> {
   const { system, messages: anthropicMessages } = toAnthropicMessages(messages)
   const body: Record<string, unknown> = {
@@ -393,6 +405,8 @@ async function callAnthropicModel(
         }
         content += delta.text
         await onDelta(delta.text)
+      } else if (delta?.type === 'thinking_delta' && delta.thinking) {
+        if (onReasoning) await onReasoning(delta.thinking)
       } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
         const current = calls.get(activeToolIndex)
         if (current) current.arguments += delta.partial_json
@@ -476,19 +490,39 @@ async function streamModelResponse(
     // Protocol: start always precedes partial updates.
     stream.push({ type: 'start', partial })
 
-    let textStarted = false
+    let textIndex = -1
+    // Reasoning arrives before the answer on thinking models, so both block
+    // indexes are allocated on demand instead of assuming position 0.
+    let thinkingIndex = -1
     const result = await callModel(config.budget, model.id, messages, tools, async (text) => {
-      if (!textStarted) {
-        textStarted = true
+      if (textIndex < 0) {
         partial.content.push({ type: 'text', text: '' } as TextContent)
-        stream.push({ type: 'text_start', contentIndex: partial.content.length - 1, partial })
+        textIndex = partial.content.length - 1
+        stream.push({ type: 'text_start', contentIndex: textIndex, partial })
       }
-      const block = partial.content[0] as TextContent
+      const block = partial.content[textIndex] as TextContent
       block.text += text
-      stream.push({ type: 'text_delta', contentIndex: 0, delta: text, partial })
-    }, config.baseUrlOverride, config.protocol, config.signal, config.runId)
-    if (textStarted) {
-      stream.push({ type: 'text_end', contentIndex: 0, content: (partial.content[0] as TextContent).text, partial })
+      stream.push({ type: 'text_delta', contentIndex: textIndex, delta: text, partial })
+    }, config.baseUrlOverride, config.protocol, config.signal, config.runId, async (text) => {
+      if (thinkingIndex < 0) {
+        partial.content.push({ type: 'thinking', thinking: '' } as ThinkingContent)
+        thinkingIndex = partial.content.length - 1
+        stream.push({ type: 'thinking_start', contentIndex: thinkingIndex, partial })
+      }
+      const block = partial.content[thinkingIndex] as ThinkingContent
+      block.thinking += text
+      stream.push({ type: 'thinking_delta', contentIndex: thinkingIndex, delta: text, partial })
+    })
+    if (thinkingIndex >= 0) {
+      stream.push({
+        type: 'thinking_end',
+        contentIndex: thinkingIndex,
+        content: (partial.content[thinkingIndex] as ThinkingContent).thinking,
+        partial,
+      })
+    }
+    if (textIndex >= 0) {
+      stream.push({ type: 'text_end', contentIndex: textIndex, content: (partial.content[textIndex] as TextContent).text, partial })
     }
 
     // pi tool calls carry parsed argument objects; arguments that are not a
