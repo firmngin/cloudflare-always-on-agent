@@ -205,6 +205,7 @@ export class WorkspaceAgent extends DurableObject<WorkspaceAgentEnv> {
 
     let created = 0
     let unchanged = 0
+    let skipped = 0
     for (const [scheduleID, target] of wanted) {
       if (existingByScheduleID.has(scheduleID)) {
         unchanged++
@@ -218,13 +219,24 @@ export class WorkspaceAgent extends DurableObject<WorkspaceAgentEnv> {
         ...(target.payload || {}),
       }
       const options = { idempotent: true }
-      if (target.kind === 'interval') {
-        const seconds = Math.max(1, Math.floor(Number(target.interval_seconds || 0)))
-        await this.scheduler.every(seconds, 'enqueueDueRun', payload, options)
-      } else {
-        const cron = String(target.cron || '').trim()
-        if (!cron) continue
-        await this.scheduler.set(cron, 'enqueueDueRun', payload, options)
+      try {
+        if (target.kind === 'interval') {
+          const seconds = Math.max(1, Math.floor(Number(target.interval_seconds || 0)))
+          await this.scheduler.every(seconds, 'enqueueDueRun', payload, options)
+        } else {
+          const cron = String(target.cron || '').trim()
+          if (!cron) continue
+          await this.scheduler.set(cron, 'enqueueDueRun', payload, options)
+        }
+      } catch (error) {
+        // One unparseable expression must not abort the whole sync: the other
+        // schedules still converge, and the backend's authoring validation is
+        // what keeps this from happening (see normalizeAgentScheduleCron).
+        console.error(
+          `schedule ${scheduleID} skipped: ${error instanceof Error ? error.message : error}`,
+        )
+        skipped++
+        continue
       }
       created++
     }
@@ -233,6 +245,10 @@ export class WorkspaceAgent extends DurableObject<WorkspaceAgentEnv> {
     const appliedConfigVersion = Math.max(0, Math.floor(Number(configRevision) || 0))
     await this.ctx.storage.put(APPLIED_VERSION_KEY, appliedVersion)
     await this.ctx.storage.put(APPLIED_CONFIG_VERSION_KEY, appliedConfigVersion)
+
+    if (skipped) {
+      console.error(`${skipped} schedule(s) could not be applied`)
+    }
 
     return {
       agent_id: identity.agentID,
