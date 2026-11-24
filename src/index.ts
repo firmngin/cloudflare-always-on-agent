@@ -45,9 +45,8 @@
  * agent's recurring schedules through the Cloudflare Agents Lifecycle +
  * Scheduler. The object only turns a fired schedule into an idempotent enqueue
  * call to Firmngin; chat long-poll and model inference stay here on the Worker.
- * `AGENT_DO_SYNC=true` enables the sync, and when it is on the once-a-minute
- * cron hour-bucket scheduler is skipped so one logical task never has two
- * schedulers.
+ * The scheduler is always the Durable Object: the once-a-minute cron hour-bucket
+ * fallback is gone, so one logical task never has two schedulers.
  *
  * Deploy: the Firmngin dashboard "Deploy to Cloudflare" button (this repo), or
  * `npx wrangler deploy` after filling in wrangler.toml and the two secrets:
@@ -158,7 +157,6 @@ export interface Env {
    * a deployment whose schedules still use the cron hour-bucket keeps working;
    * the dashboard/template turns it on once `agent_schedules` sync is live.
    */
-  AGENT_DO_SYNC?: string
   /** Named SQLite Durable Object per agent (`WorkspaceAgent`). */
   WORKSPACE_AGENT?: DurableObjectNamespace<WorkspaceAgentType>
   /**
@@ -169,7 +167,7 @@ export interface Env {
   SUBREQUEST_BUDGET?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.22'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.3.0'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -218,8 +216,6 @@ let maxTurnsPerInvocationEnv = ''
 let inboxBatchEnv = ''
 // "pi" (default) | "builtin": which turn engine runs claimed turns.
 let agentEngine: 'pi' | 'builtin' = 'pi'
-// Per-agent Durable Object sync (schedules). Off unless AGENT_DO_SYNC=true.
-let doSyncEnabled = false
 // The current invocation's env binding: the Durable Object namespace is only
 // reachable through it, so it is captured by applyEnv().
 let runtimeEnv: Env | null = null
@@ -1074,20 +1070,6 @@ async function heartbeat(trace: RuntimeTrace, budget: SubrequestBudget): Promise
 // returns the existing queued turn instead of duplicating it. Legacy fallback
 // only: an agent whose schedules are owned by its Durable Object must NOT also
 // be enqueued from cron (two schedulers for one logical task).
-async function queueScheduledRuns(agents: WorkerAgent[], budget: SubrequestBudget): Promise<void> {
-  const hourBucket = new Date().toISOString().slice(0, 13)
-  for (const agent of agents) {
-    try {
-      await agentFetch(`/agents/${agent.id}/scheduled-runs`, {
-        method: 'POST',
-        body: JSON.stringify({ idempotency_key: `${agent.id}:${hourBucket}` }),
-      }, budget)
-    } catch (error) {
-      console.error(`scheduled run for agent ${agent.id} failed:`, error instanceof Error ? error.message : error)
-    }
-  }
-}
-
 /** Agent roster for this workspace Worker token; never throws. */
 async function listWorkerAgents(budget: SubrequestBudget): Promise<WorkerAgent[]> {
   // Preferred: the scoped deployment config. It carries the workspace id the
@@ -1357,7 +1339,7 @@ async function handleWake(request: Request, budget: SubrequestBudget): Promise<R
 /**
  * Desired schedules for one agent, as owned by the backend (`agent_schedules`).
  * An absent endpoint (older backend) is a no-op, not an error: DO sync turns on
- * through AGENT_DO_SYNC only after this contract ships.
+ * as the only scheduler.
  */
 async function fetchDesiredSchedules(agentId: string, budget: SubrequestBudget): Promise<DesiredSchedule[] | null> {
   try {
@@ -1390,7 +1372,7 @@ async function syncAgentDurableObjects(agents: WorkerAgent[], budget: Subrequest
   const owned = new Set<string>()
   const namespace = runtimeEnv?.WORKSPACE_AGENT
   if (!namespace) {
-    console.error('AGENT_DO_SYNC is enabled but the WORKSPACE_AGENT binding is missing; leaving schedules on the cron fallback')
+    console.error('WORKSPACE_AGENT binding is missing: user schedules cannot run (no fallback scheduler exists)')
     return owned
   }
   for (const agent of agents) {
@@ -1443,7 +1425,6 @@ function applyEnv(env: Env) {
   inboxBatchEnv = env.INBOX_BATCH || ''
   applyModelRuntimeEnv(env)
   agentEngine = String(env.AGENT_ENGINE || '').trim().toLowerCase() === 'builtin' ? 'builtin' : 'pi'
-  doSyncEnabled = String(env.AGENT_DO_SYNC || '').trim().toLowerCase() === 'true'
 }
 
 function isBaseConfigured(): boolean {
@@ -1522,15 +1503,11 @@ export default {
       await Promise.all([
         heartbeat(trace, budget),
         (async () => {
+          // Schedules have exactly one owner: the per-agent Durable Object.
+          // There is no hourly cron fallback — it could not express "every 3
+          // minutes", so keeping it only produced extra runs nobody asked for.
           const agents = await listWorkerAgents(budget)
-          if (doSyncEnabled) {
-            // Every successfully synced agent is DO-owned, including an agent
-            // whose desired schedule list is empty.
-            const owned = await syncAgentDurableObjects(agents, budget)
-            await queueScheduledRuns(agents.filter((agent) => !owned.has(agent.id)), budget)
-            return
-          }
-          await queueScheduledRuns(agents, budget)
+          await syncAgentDurableObjects(agents, budget)
         })(),
       ])
       await drain

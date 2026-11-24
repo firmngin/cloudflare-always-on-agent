@@ -104,11 +104,9 @@ which backend a deployment is actually talking to.
 
 1. Sends a heartbeat (drives the "Worker connected" status in the dashboard).
 2. Lists the workspace's agents and syncs each agent's **Durable Object**
-   schedules (`AGENT_DO_SYNC=true`). An agent with at least one configured
-   schedule is owned by its object and is no longer queued from cron; an agent
-   with no schedule keeps the legacy hour-bucketed scheduled turn. While the
-   flag is `false` the legacy path applies to every agent. There is never more
-   than one scheduler per agent.
+   schedules (cron, interval, or one-shot). The object is the only scheduler:
+   the legacy hour-bucketed cron turn was removed, so an agent can never be
+   scheduled twice and a 3-minute interval is expressible.
 3. Drains the merged inbox: claims each queued turn (interactive chat replies
    and scheduled runs go through the same loop), executes it with tool access,
    streams deltas/tool events, and reports the final answer. Capacity is per

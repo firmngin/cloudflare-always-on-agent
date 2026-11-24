@@ -72,12 +72,8 @@ MAX_STEPS = "8"
 # mirrors a higher limit than the deployment really has, the terminal run report
 # is still what gets lost.
 
-# Per-agent Durable Object sync (Lifecycle + Scheduler). On by default: without it
-# the only scheduler is the once-a-minute cron hour-bucket, which cannot express
-# "every 3 minutes" and ignores user-authored schedules. The backend already
-# exposes GET /agent-runtime/worker/agents/:id/schedules, and the Durable Object
-# binding ships with every release, so both schedulers are never active at once.
-AGENT_DO_SYNC = "true"
+# Schedules are owned by the per-agent Durable Object (Lifecycle + Scheduler);
+# there is no cron fallback scheduler, so no flag controls this anymore.
 
 # Secrets (set in the deploy wizard or `wrangler secret put`):
 #   WORKER_TOKEN  - the workspace Worker token (fng_aow_...) shown once in the

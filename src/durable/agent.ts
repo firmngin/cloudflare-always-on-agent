@@ -13,7 +13,7 @@
  * ... long polling, heavy LLM wait", §6.4). A scheduler callback must be short
  * and idempotent because Cloudflare may replay it after eviction.
  *
- * Enablement: the Worker only syncs objects when `AGENT_DO_SYNC="true"` so a
+ * The Worker always syncs these objects (there is no cron fallback scheduler) so a
  * deployment that has not moved its schedules yet keeps working unchanged.
  */
 
