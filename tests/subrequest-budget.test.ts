@@ -259,6 +259,9 @@ test('a run slice never exceeds what the invocation has left', async () => {
 test('slice sizing keeps a floor and a ceiling', async () => {
   const { runBudgetSlice } = await import('../src/runtime/subrequest-budget.ts')
   assert.equal(runBudgetSlice(0, 3), 12)
-  assert.equal(runBudgetSlice(40, 1), 20)
-  assert.equal(runBudgetSlice(1000, 0), 250)
+  // A single turn gets everything that is left: splitting by concurrent+1
+  // starved it and failed a normal tool-heavy answer.
+  assert.equal(runBudgetSlice(40, 1), 40)
+  assert.equal(runBudgetSlice(1600, 4), 400)
+  assert.equal(runBudgetSlice(1000, 0), 400)
 })

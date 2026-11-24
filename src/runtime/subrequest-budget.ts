@@ -206,10 +206,18 @@ export class ScopedBudget implements BudgetView {
   }
 }
 
-/** Per-run slice: an even share of what is left, with a floor and a ceiling. */
+/**
+ * Per-run slice of what is left.
+ *
+ * The divisor is the number of turns sharing it *now* (this one included). An
+ * earlier version divided by concurrent+1, so a single turn only saw half the
+ * budget and a tool-heavy answer died with `subrequest budget spent (essential)`
+ * even though nothing else was running.
+ */
 export function runBudgetSlice(remaining: number, concurrentTurns: number): number {
-  const share = Math.floor(Math.max(0, remaining) / Math.max(1, concurrentTurns + 1))
-  return Math.min(250, Math.max(12, share))
+  const sharers = Math.max(1, Math.floor(Number(concurrentTurns) || 1))
+  const share = Math.floor(Math.max(0, remaining) / sharers)
+  return Math.min(400, Math.max(12, share))
 }
 
 export class SubrequestBudget {
