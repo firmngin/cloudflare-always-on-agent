@@ -45,6 +45,7 @@ import type { Claim, EventStream, McpClient } from '../index'
 import { shouldConnectMcp, type TurnOutput } from '../runtime/turn'
 import type { SubrequestBudget } from '../runtime/subrequest-budget'
 import { ApiError, createStreamFn, resolveModelProtocol, type ModelProtocol } from './stream-fn'
+import { composeSystemPrompt } from './prompt'
 import { mapMcpTools, summarize } from './tools'
 import { createLoadSkillTool, parseSkills, renderSkillsIndex } from './skills'
 import { createSpawnSubagentTool, createSubagentRunner } from './subagent'
@@ -82,13 +83,12 @@ export async function executeTurnPi(agentId: string, claim: Claim, events: Event
   // Two-level system prompt: platform capabilities first, then the owner's
   // instruction last (recency + ownership). Without platform_prompt (older
   // backends) the assembly is unchanged: task_prompt + skills index.
-  const platformText = String(claim.platform_prompt || '').trim()
-  const taskText = String(claim.task_prompt || '').trim()
-  const sections: string[] = []
-  if (platformText) sections.push(platformText)
-  if (skillsIndex) sections.push(skillsIndex)
-  if (taskText) sections.push(platformText ? `# Owner instructions\n\n${taskText}` : taskText)
-  const systemPrompt = sections.join('\n\n')
+  const systemPrompt = composeSystemPrompt({
+    agentName: claim.agent_name,
+    platformText: claim.platform_prompt,
+    skillsIndex,
+    taskText: claim.task_prompt,
+  })
   // The sub-agent sees the parent's tools but not `spawn_subagent`, so delegation
   // is one level deep (and read-only, because the MCP scopes are).
   const baseTools: AgentTool[] = [...(mcp ? mapMcpTools(mcp) : []), ...createLoadSkillTool(skills)]

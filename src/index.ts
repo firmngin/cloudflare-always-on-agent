@@ -74,6 +74,7 @@ import {
   type ChatMessage,
   type Role,
 } from './pi/stream-fn'
+import { composeSystemPrompt } from './pi/prompt'
 import { safeJson, summarize, type McpTool } from './pi/tools'
 import { executeTurnPi, type PiEngineDeps } from './pi/engine'
 import { inboxPollBudget, isPlaceholderToken, resolveBackendUrl, trimSlash, withRequestTimeout } from './runtime/endpoints'
@@ -157,7 +158,7 @@ export interface Env {
   SUBREQUEST_BUDGET?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.15'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.16'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -281,6 +282,8 @@ export interface Claim {
   // task_prompt is assembled below it.
   task_prompt: string
   platform_prompt?: string
+  /** The owner's name for this agent, so it knows who it is. */
+  agent_name?: string
   model: string
   // Optional so older backends keep working; the Worker falls back to its
   // MODEL_BASE_URL env when they are absent.
@@ -899,13 +902,12 @@ async function executeTurnBuiltin(
   })
   const tools = mcp?.tools || []
 
-  // Two-level system prompt: platform capabilities first, owner instruction
-  // last. Without platform_prompt (older backends) this is unchanged.
-  const platformText = String(claim.platform_prompt || '').trim()
-  const taskText = String(claim.task_prompt || '').trim()
-  const systemContent = platformText && taskText
-    ? `${platformText}\n\n# Owner instructions\n\n${taskText}`
-    : (taskText || platformText)
+  // Identity + platform capabilities first, owner instruction last.
+  const systemContent = composeSystemPrompt({
+    agentName: claim.agent_name,
+    platformText: claim.platform_prompt,
+    taskText: claim.task_prompt,
+  })
 
   const messages: ChatMessage[] = [
     { role: 'system', content: systemContent },
