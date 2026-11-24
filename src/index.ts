@@ -169,7 +169,7 @@ export interface Env {
   SUBREQUEST_BUDGET?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.21'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.22'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
