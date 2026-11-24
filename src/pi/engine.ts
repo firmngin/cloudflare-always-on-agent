@@ -47,6 +47,7 @@ import type { SubrequestBudget } from '../runtime/subrequest-budget'
 import { ApiError, createStreamFn, resolveModelProtocol, type ModelProtocol } from './stream-fn'
 import { mapMcpTools, summarize } from './tools'
 import { createLoadSkillTool, parseSkills, renderSkillsIndex } from './skills'
+import { createSpawnSubagentTool, createSubagentRunner } from './subagent'
 
 // Reasoning text is forwarded for the dashboard timeline, but it never earns a
 // bigger event payload than this.
@@ -62,8 +63,8 @@ export interface PiEngineDeps {
 }
 
 export async function executeTurnPi(agentId: string, claim: Claim, events: EventStream, deps: PiEngineDeps, signal?: AbortSignal): Promise<TurnOutput> {
-  const model = claim.model
-  if (!model) throw new ApiError(0, 'Agent config has no model', 'CONFIG_INVALID')
+  const modelId = claim.model
+  if (!modelId) throw new ApiError(0, 'Agent config has no model', 'CONFIG_INVALID')
   const protocol = resolveModelProtocol(claim)
   const mcpStartedAt = Date.now()
   const mcpEnabled = shouldConnectMcp(claim)
@@ -88,7 +89,25 @@ export async function executeTurnPi(agentId: string, claim: Claim, events: Event
   if (skillsIndex) sections.push(skillsIndex)
   if (taskText) sections.push(platformText ? `# Owner instructions\n\n${taskText}` : taskText)
   const systemPrompt = sections.join('\n\n')
-  const tools: AgentTool[] = [...(mcp ? mapMcpTools(mcp) : []), ...createLoadSkillTool(skills)]
+  // The sub-agent sees the parent's tools but not `spawn_subagent`, so delegation
+  // is one level deep (and read-only, because the MCP scopes are).
+  const baseTools: AgentTool[] = [...(mcp ? mapMcpTools(mcp) : []), ...createLoadSkillTool(skills)]
+  const model = buildPiModel(claim, protocol)
+  const tools: AgentTool[] = [
+    ...baseTools,
+    ...createSpawnSubagentTool({
+      runTask: createSubagentRunner({
+        systemPrompt,
+        tools: baseTools,
+        model,
+        protocol,
+        budget: deps.budget,
+        runId: claim.run_id,
+        baseUrlOverride: claim.model_base_url,
+        signal,
+      }),
+    }),
+  ]
 
   // pi messages carry timestamps; history roles are filtered exactly like the
   // builtin engine's history filter (user/assistant only). Assistant turns are
@@ -132,7 +151,7 @@ export async function executeTurnPi(agentId: string, claim: Claim, events: Event
   let finalAssistant: AssistantMessage | undefined
 
   const config: AgentLoopConfig = {
-    model: buildPiModel(claim, protocol),
+    model,
     // Transcript messages are already LLM-compatible pi Messages; pass the
     // standard roles through unchanged.
     convertToLlm: (messages) =>
