@@ -228,3 +228,37 @@ test('the first delta flushes immediately and the batch limits are size, count a
   // A turn that spent its share stops spending even when the batch is large.
   assert.equal(shouldFlushEventBatch({ spent: 11, allowance: 11, events: 999, bytes: 1e6, sinceFlushMs: 1e6, firstFlushed: true }), false)
 })
+
+// Per-run slices: one long streamed answer must not drain the turns next to it.
+test('a run slice caps its own spend and still charges the invocation', async () => {
+  const { ScopedBudget, SubrequestBudget, runBudgetSlice } = await import('../src/runtime/subrequest-budget.ts')
+  const invocation = new SubrequestBudget(50)
+  const scoped = new ScopedBudget(invocation, 3)
+
+  assert.equal(scoped.take('bestEffort'), true)
+  assert.equal(scoped.take('bestEffort'), true)
+  assert.equal(scoped.take('bestEffort'), true)
+  // The slice is spent; the invocation still has room for the other turns.
+  assert.equal(scoped.take('bestEffort'), false)
+  assert.equal(scoped.spent, 3)
+  assert.equal(invocation.spent, 3)
+  assert.equal(scoped.remaining(), 0)
+
+  // Terminal reports keep coming from the invocation pool.
+  assert.notEqual(invocation.reserveRun('run-1'), null)
+})
+
+test('a run slice never exceeds what the invocation has left', async () => {
+  const { ScopedBudget, SubrequestBudget } = await import('../src/runtime/subrequest-budget.ts')
+  const invocation = new SubrequestBudget(50)
+  for (let index = 0; index < 48; index += 1) invocation.take('bestEffort')
+  const scoped = new ScopedBudget(invocation, 250)
+  assert.equal(scoped.remaining() <= invocation.remaining(), true)
+})
+
+test('slice sizing keeps a floor and a ceiling', async () => {
+  const { runBudgetSlice } = await import('../src/runtime/subrequest-budget.ts')
+  assert.equal(runBudgetSlice(0, 3), 12)
+  assert.equal(runBudgetSlice(40, 1), 20)
+  assert.equal(runBudgetSlice(1000, 0), 250)
+})

@@ -130,6 +130,88 @@ export class RunTerminalReservation {
   }
 }
 
+/** The surface a turn needs from a budget: its own cap, the invocation's authority. */
+export interface BudgetView {
+  readonly spent: number
+  readonly exhausted: boolean
+  readonly redirectsSeen: number
+  readonly reserved: number
+  remaining(): number
+  allows(tier: SubrequestTier): boolean
+  take(tier: SubrequestTier): boolean
+  reserveRun(runId: string): RunTerminalReservation | null
+  /** Best-effort share for a turn, never more than this slice can spend. */
+  bestEffortAllowance(slots: number): number
+  /** Platform-level limit marker, forwarded to the invocation budget. */
+  markCapHit(): void
+  noteRedirect(): void
+}
+
+/**
+ * One run's slice of the invocation budget.
+ *
+ * Without it every concurrent turn spent from one shared counter: a single long
+ * streamed answer with many event flushes could leave the other turns without a
+ * model step. The slice is a hard cap for this run, and every charge still goes
+ * through the parent, so the invocation limit stays the outer bound.
+ */
+export class ScopedBudget implements BudgetView {
+  private used = 0
+
+  constructor(
+    private readonly parent: BudgetView,
+    readonly limit: number,
+  ) {}
+
+  get spent(): number { return this.used }
+  get exhausted(): boolean { return this.parent.exhausted }
+  get redirectsSeen(): number { return this.parent.redirectsSeen }
+  get reserved(): number { return this.parent.reserved }
+
+  remaining(): number {
+    return Math.max(0, Math.min(this.limit - this.used, this.parent.remaining()))
+  }
+
+  allows(tier: SubrequestTier): boolean {
+    if (this.used >= this.limit) return false
+    return this.parent.allows(tier)
+  }
+
+  take(tier: SubrequestTier): boolean {
+    if (this.used >= this.limit) return false
+    if (!this.parent.take(tier)) return false
+    this.used++
+    return true
+  }
+
+  reserveRun(runId: string): RunTerminalReservation | null {
+    // Terminal reports are reserved from the invocation pool, never from the
+    // run's slice: the report must outlive the slice it reports on.
+    return this.parent.reserveRun(runId)
+  }
+
+  bestEffortAllowance(slots: number): number {
+    // Never more than this run can still spend: the slice is the hard cap and
+    // the invocation-wide share is the outside bound.
+    return Math.max(1, Math.min(this.remaining(), this.parent.bestEffortAllowance(slots)))
+  }
+
+  markCapHit(): void {
+    // A platform rejection is an invocation-wide fact, not a per-run one.
+    this.parent.markCapHit()
+  }
+
+  noteRedirect(): void {
+    this.parent.noteRedirect()
+  }
+}
+
+/** Per-run slice: an even share of what is left, with a floor and a ceiling. */
+export function runBudgetSlice(remaining: number, concurrentTurns: number): number {
+  const share = Math.floor(Math.max(0, remaining) / Math.max(1, concurrentTurns + 1))
+  return Math.min(250, Math.max(12, share))
+}
+
 export class SubrequestBudget {
   /** The platform limit this budget mirrors. */
   readonly limit: number

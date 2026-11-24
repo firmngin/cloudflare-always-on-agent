@@ -103,6 +103,9 @@ import {
   shouldFlushEventBatch,
   SubrequestBudgetExhaustedError,
   REPORT_ATTEMPTS_PER_RUN,
+  runBudgetSlice,
+  ScopedBudget,
+  type BudgetView,
   type RunTerminalReservation,
   type SubrequestBudget,
   type SubrequestCharge,
@@ -166,7 +169,7 @@ export interface Env {
   SUBREQUEST_BUDGET?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.17'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.18'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -341,7 +344,7 @@ function runtimeUrl(path: string): string {
 async function agentFetch(
   path: string,
   init: RequestInit,
-  budget: SubrequestBudget,
+  budget: BudgetView,
   charge: SubrequestCharge = 'essential',
 ): Promise<Response> {
   const response = await fetchWithBudget(budget, runtimeUrl(path), {
@@ -770,19 +773,26 @@ async function drainInbox(budget: SubrequestBudget): Promise<void> {
 }
 
 /** Runs one claimed turn; false means this invocation could not reserve its report. */
-async function executeInboxItem(item: InboxItem, budget: SubrequestBudget): Promise<boolean> {
+async function executeInboxItem(item: InboxItem, invocationBudget: SubrequestBudget): Promise<boolean> {
   // Counted for the lane's cap from claim through report so overlapping
   // invocations cannot push the isolate past it.
   const lane = normalizeLane(item.lane)
   if (!tryReserveTurn(lane)) return true
+  // Each turn spends from its own slice of what is left, so one long streamed
+  // answer cannot leave the concurrent turns without a model step. Terminal
+  // reports still come from the invocation pool.
+  const budget: BudgetView = new ScopedBudget(
+    invocationBudget,
+    runBudgetSlice(invocationBudget.remaining(), activeTurnsFor(lane)),
+  )
   // The terminal report is reserved BEFORE the claim: a turn this invocation
   // cannot report is left queued instead of claimed and then stalled.
-  const reservation = budget.reserveRun(item.run_id)
+  const reservation = invocationBudget.reserveRun(item.run_id)
   if (!reservation) {
     releaseTurn(lane)
     console.log({
       event: 'run.stage', run_id: item.run_id, stage: 'terminal_reserve_unavailable',
-      subrequests_remaining: budget.remaining(), subrequests_reserved: budget.reserved,
+      subrequests_remaining: invocationBudget.remaining(), subrequests_reserved: invocationBudget.reserved,
     })
     return false
   }
@@ -821,7 +831,7 @@ async function executeInboxItem(item: InboxItem, budget: SubrequestBudget): Prom
 }
 
 async function claimTurn(
-  budget: SubrequestBudget,
+  budget: BudgetView,
   agentId: string,
   messageId: number,
   claimToken: string,
@@ -862,7 +872,7 @@ interface TurnResult {
 }
 
 async function runTurn(
-  budget: SubrequestBudget,
+  budget: BudgetView,
   reservation: RunTerminalReservation,
   agentId: string,
   claim: Claim,
@@ -936,7 +946,7 @@ function piEngineDeps(budget: SubrequestBudget): PiEngineDeps {
 }
 
 async function executeTurnBuiltin(
-  budget: SubrequestBudget,
+  budget: BudgetView,
   agentId: string,
   claim: Claim,
   events: EventStream,
@@ -1027,7 +1037,7 @@ async function executeTurnBuiltin(
  * report may close the run's wake event.
  */
 async function finishRun(
-  budget: SubrequestBudget,
+  budget: BudgetView,
   reservation: RunTerminalReservation,
   agentId: string,
   runId: string,
@@ -1132,7 +1142,7 @@ async function handshake(trace: RuntimeTrace, budget: SubrequestBudget): Promise
  * the idempotent PATCH is retried.
  */
 async function replayPendingReport(
-  budget: SubrequestBudget,
+  budget: BudgetView,
   reservation: RunTerminalReservation,
   wake: WakePayload,
   pending: PendingRunReport,
