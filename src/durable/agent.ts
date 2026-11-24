@@ -44,10 +44,12 @@ export interface WorkspaceAgentEnv extends BackendEnvLike {
 export interface DesiredSchedule {
   schedule_id: string
   name: string
-  kind: 'cron' | 'interval'
+  kind: 'cron' | 'interval' | 'once'
   /** UTC cron expression (the backend converts from the authored timezone). */
   cron?: string
   interval_seconds?: number
+  /** Single firing instant (epoch ms) for a `once` schedule. */
+  run_at_ms?: number
   payload?: Record<string, unknown>
   enabled: boolean
   desired_version: number
@@ -220,7 +222,13 @@ export class WorkspaceAgent extends DurableObject<WorkspaceAgentEnv> {
       }
       const options = { idempotent: true }
       try {
-        if (target.kind === 'interval') {
+        if (target.kind === 'once') {
+          const runAt = Number(target.run_at_ms || 0)
+          // A once schedule with no instant cannot be represented; the backend
+          // rejects it at authoring, so this only guards a stale payload.
+          if (!Number.isFinite(runAt) || runAt <= 0) continue
+          await this.scheduler.set(new Date(runAt), 'enqueueDueRun', payload, options)
+        } else if (target.kind === 'interval') {
           const seconds = Math.max(1, Math.floor(Number(target.interval_seconds || 0)))
           await this.scheduler.every(seconds, 'enqueueDueRun', payload, options)
         } else {
@@ -338,6 +346,17 @@ export class WorkspaceAgent extends DurableObject<WorkspaceAgentEnv> {
 function sameSignature(schedule: Schedule<any>, desired: DesiredSchedule): boolean {
   const payload = (schedule.payload || {}) as DueRunPayload
   if (String(payload.schedule_name || '') !== String(desired.name || '')) return false
+  if (desired.kind === 'once') {
+    // A dated schedule is a single job: match on its instant.
+    if (schedule.type !== 'cron' && schedule.type !== 'date' && schedule.type !== 'delayed') return false
+    const runAt = Number(desired.run_at_ms || 0)
+    if (!Number.isFinite(runAt) || runAt <= 0) return false
+    // The SDK reports the pending instant as `nextTime`; fall back to recreating
+    // when it is unavailable, which is safe (cancel + set).
+    const next = Number((schedule as unknown as { nextTime?: number }).nextTime || 0)
+    if (!next) return false
+    return Math.abs(next - runAt) < 1000
+  }
   if (desired.kind === 'interval') {
     if (schedule.type !== 'interval') return false
     return Number(schedule.intervalSeconds || 0) === Math.max(1, Math.floor(Number(desired.interval_seconds || 0)))
