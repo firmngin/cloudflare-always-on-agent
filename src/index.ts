@@ -137,6 +137,14 @@ export interface Env {
   /** Output cap for providers that require it (Anthropic Messages). */
   MODEL_MAX_TOKENS?: string
   MAX_STEPS?: string
+  /** Turns that may stream at once in the chat lane (default 2, clamped 1..16). */
+  MAX_INTERACTIVE_TURNS?: string
+  /** Turns that may stream at once in the background lane (default 2, clamped 1..16). */
+  MAX_BACKGROUND_TURNS?: string
+  /** Turns one invocation may start in total (default 10, clamped 1..100). */
+  MAX_TURNS_PER_INVOCATION?: string
+  /** Runs one inbox poll may return (default 5, clamped 1..20). */
+  INBOX_BATCH?: string
   /**
    * Turn engine: "pi" (default) runs the pinned pi agent core; "builtin"
    * runs the previous hand-rolled loop. Any other value falls back to "pi".
@@ -158,7 +166,7 @@ export interface Env {
   SUBREQUEST_BUDGET?: string
 }
 
-const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.16'
+const WORKER_VERSION = 'firmngin-data-agent-worker/2.2.17'
 
 // Firmngin enforces a per-run deadline of ~5 minutes; finish reporting before
 // it so the run's terminal state always comes from the Worker itself.
@@ -183,7 +191,9 @@ const HELD_POLL_THRESHOLD_MS = 1_000
 // analysis can never occupy a chat slot. Before lanes, one streaming analysis
 // left a single slot for every chat turn on the isolate.
 const MAX_CONCURRENT_TURNS = 2
-const MAX_BACKGROUND_TURNS = 1
+// Background work gets two slots: a delegated turn used to wait behind whatever
+// cron/analysis run was already in flight.
+const MAX_BACKGROUND_TURNS = 2
 // Turns that may run at the same time in one invocation; they share its
 // subrequest budget, so each one's best-effort share is derived from this and
 // every claimed run reserves its own terminal headroom before the claim.
@@ -197,6 +207,12 @@ const EVENT_PENDING_LIMIT = 256
 let apiUrl = ''
 let workerToken = ''
 let maxStepsEnv = ''
+// Capacity knobs. Heavy deployments raise these together with SUBREQUEST_BUDGET;
+// the defaults keep a Free-plan deployment inside its limits.
+let maxInteractiveTurnsEnv = ''
+let maxBackgroundTurnsEnv = ''
+let maxTurnsPerInvocationEnv = ''
+let inboxBatchEnv = ''
 // "pi" (default) | "builtin": which turn engine runs claimed turns.
 let agentEngine: 'pi' | 'builtin' = 'pi'
 // Per-agent Durable Object sync (schedules). Off unless AGENT_DO_SYNC=true.
@@ -214,9 +230,28 @@ const activeTurnsByLane: Record<string, number> = {
   [BACKGROUND_LANE]: 0,
 }
 
+/** Parses a positive integer env value, clamped to a sane range. */
+function intEnv(raw: string, fallback: number, min: number, max: number): number {
+  const parsed = Math.floor(Number(String(raw || '').trim()))
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  return Math.min(max, Math.max(min, parsed))
+}
+
 /** Lane capacity: chat keeps its own pool, background work gets a smaller one. */
 function laneTurnCap(lane?: string | null): number {
-  return normalizeLane(lane) === BACKGROUND_LANE ? MAX_BACKGROUND_TURNS : MAX_CONCURRENT_TURNS
+  return normalizeLane(lane) === BACKGROUND_LANE
+    ? intEnv(maxBackgroundTurnsEnv, MAX_BACKGROUND_TURNS, 1, 16)
+    : intEnv(maxInteractiveTurnsEnv, MAX_CONCURRENT_TURNS, 1, 16)
+}
+
+/** Turns one invocation may start before it hands the rest to the next tick. */
+function maxTurnsPerInvocation(): number {
+  return intEnv(maxTurnsPerInvocationEnv, MAX_TURNS_PER_INVOCATION, 1, 100)
+}
+
+/** Runs one poll may return. */
+function inboxBatchSize(): number {
+  return intEnv(inboxBatchEnv, INBOX_BATCH, 1, 20)
 }
 
 /** Turns in flight for one lane. */
@@ -618,12 +653,16 @@ async function drainInbox(budget: SubrequestBudget): Promise<void> {
   draining = true
   const startedAt = Date.now()
   let handled = 0
+  let stopDraining = false
+  // Turns this invocation started but has not awaited yet (at most
+  // MAX_TURNS_PER_INVOCATION, so the list cannot grow).
+  const inFlight: Promise<void>[] = []
   try {
     // Sustained drain: poll until the invocation budget is spent. Every extra
     // poll keeps a long-poll waiter registered with the backend, and a queued
     // message wakes it immediately — the pickup latency the dashboard shows as
     // "waiting for the Worker".
-    while (handled < MAX_TURNS_PER_INVOCATION && Date.now() - startedAt < DRAIN_BUDGET_MS) {
+    while (handled < maxTurnsPerInvocation() && Date.now() - startedAt < DRAIN_BUDGET_MS) {
       // Every poll is a subrequest. Once this invocation cannot afford one, stop
       // draining instead of failing the poll: the next tick starts with a fresh
       // budget and the queued turn is still there.
@@ -640,7 +679,7 @@ async function drainInbox(budget: SubrequestBudget): Promise<void> {
         // a timeout must release the network request and the BE wake waiter.
         const { response, payload } = await withRequestTimeout(async (signal) => {
           const response = await agentFetch(
-            `/inbox?wait=${pollBudget.waitSeconds}s&limit=${INBOX_BATCH}`,
+            `/inbox?wait=${pollBudget.waitSeconds}s&limit=${inboxBatchSize()}`,
             { method: 'GET', signal },
             budget,
           )
@@ -682,7 +721,9 @@ async function drainInbox(budget: SubrequestBudget): Promise<void> {
         activeTurnsFor,
         laneTurnCap,
         handled,
-        MAX_TURNS_PER_INVOCATION,
+        maxTurnsPerInvocation(),
+        // Fairness: one agent's backlog must not take every slot in the poll.
+        (item: InboxItem) => String(item.agent_id || ''),
       )
       for (const lane of skipped) {
         console.log(`turn capacity reached for ${lane} lane; leaving the rest for the next invocation`)
@@ -699,17 +740,31 @@ async function drainInbox(budget: SubrequestBudget): Promise<void> {
         console.log(`subrequest budget spent; leaving ${reserved} queued turn(s) for the next invocation`)
         return
       }
-      // Dispatch the lanes together: serializing them here is what let a full
-      // background lane delay chat pickup for the whole poll. A turn whose
-      // terminal report this invocation cannot reserve is left queued, so the
-      // drain ends instead of re-polling rows it cannot finish.
-      const laneResults = await Promise.all(batches.map(({ items: laneItems }) =>
-        Promise.allSettled(laneItems.map((item) => executeInboxItem(item, budget))),
-      ))
+      // Dispatch the lanes together, then keep polling instead of waiting for
+      // them: a run queued *while* another turn streams (a delegated agent, a
+      // second chat thread) must be claimable in the same invocation, otherwise
+      // it only starts after the first turn ends.
+      const batchPromises = batches.flatMap(({ items: laneItems }) =>
+        laneItems.map((item) => executeInboxItem(item, budget)),
+      )
       handled += reserved
-      if (laneResults.some((lane) => lane.some((result) => result.status === 'fulfilled' && !result.value))) return
+      for (const promise of batchPromises) {
+        inFlight.push(promise
+          .then((started) => {
+            // A turn that cannot reserve its terminal report means this
+            // invocation is out of budget: stop claiming new ones.
+            if (!started) stopDraining = true
+          })
+          .catch((error) => {
+            console.error('turn failed:', error instanceof Error ? error.message : error)
+          }))
+      }
+      if (stopDraining) break
     }
   } finally {
+    // Never return while a turn is still streaming: the invocation must not end
+    // under an open report.
+    await Promise.allSettled(inFlight)
     draining = false
   }
 }
@@ -1372,6 +1427,10 @@ function applyEnv(env: Env) {
   apiUrl = resolveBackendUrl(env)
   workerToken = env.WORKER_TOKEN || ''
   maxStepsEnv = env.MAX_STEPS || ''
+  maxInteractiveTurnsEnv = env.MAX_INTERACTIVE_TURNS || ''
+  maxBackgroundTurnsEnv = env.MAX_BACKGROUND_TURNS || ''
+  maxTurnsPerInvocationEnv = env.MAX_TURNS_PER_INVOCATION || ''
+  inboxBatchEnv = env.INBOX_BATCH || ''
   applyModelRuntimeEnv(env)
   agentEngine = String(env.AGENT_ENGINE || '').trim().toLowerCase() === 'builtin' ? 'builtin' : 'pi'
   doSyncEnabled = String(env.AGENT_DO_SYNC || '').trim().toLowerCase() === 'true'

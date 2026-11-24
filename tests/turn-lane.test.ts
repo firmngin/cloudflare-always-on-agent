@@ -4,6 +4,7 @@ import {
   BACKGROUND_LANE,
   INTERACTIVE_LANE,
   classifyRunReport,
+  interleaveByAgent,
   normalizeLane,
   planLaneBatches,
   shouldCompleteWake,
@@ -119,4 +120,24 @@ test('the wake event is completed only on an acknowledged report', () => {
   assert.equal(shouldCompleteWake('ambiguous'), false)
   assert.equal(shouldCompleteWake('rejected'), false)
   assert.equal(shouldCompleteWake('unsent'), false)
+})
+
+// Heavy-use fairness: one agent's backlog must not eat every slot in a poll.
+test('a busy agent does not take the whole lane from a quiet one', () => {
+  const busy = ['a1', 'a2', 'a3', 'a4'].map((id) => ({ agent_id: 'agent-a', run: id }))
+  const quiet = [{ agent_id: 'agent-b', run: 'b1' }]
+  const ordered = interleaveByAgent([...busy, ...quiet], (item) => item.agent_id)
+  assert.deepEqual(ordered.map((item) => item.run), ['a1', 'b1', 'a2', 'a3', 'a4'])
+})
+
+test('planning a poll with fairness keeps both agents in the batch', () => {
+  const byLane = new Map<string, { agent_id: string, run: string }[]>([
+    [INTERACTIVE_LANE, [
+      { agent_id: 'agent-a', run: 'a1' },
+      { agent_id: 'agent-a', run: 'a2' },
+      { agent_id: 'agent-b', run: 'b1' },
+    ]],
+  ])
+  const plan = planLaneBatches(byLane, () => 0, () => 2, 0, 10, (item) => item.agent_id)
+  assert.deepEqual(plan.batches[0].items.map((item) => item.run), ['a1', 'b1'])
 })

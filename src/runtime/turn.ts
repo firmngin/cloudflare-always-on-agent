@@ -85,6 +85,39 @@ export function turnBatchCapacity(
   ))
 }
 
+/**
+ * Interleaves items so that consecutive entries come from different agents.
+ *
+ * Under load one busy agent can queue several turns while another has one. Slicing
+ * the poll in arrival order would let the busy agent take every slot, so the
+ * second agent's single turn waits a whole invocation. Round-robin keeps the
+ * lanes busy across agents instead of across one agent's backlog.
+ */
+export function interleaveByAgent<T>(items: T[], keyOf: (item: T) => string): T[] {
+  if (items.length < 2) return items.slice()
+  const groups = new Map<string, T[]>()
+  const order: string[] = []
+  for (const item of items) {
+    const key = keyOf(item) || ''
+    const group = groups.get(key)
+    if (group) {
+      group.push(item)
+      continue
+    }
+    groups.set(key, [item])
+    order.push(key)
+  }
+  if (order.length < 2) return items.slice()
+  const out: T[] = []
+  for (let index = 0; out.length < items.length; index += 1) {
+    for (const key of order) {
+      const group = groups.get(key)
+      if (group && group[index] !== undefined) out.push(group[index])
+    }
+  }
+  return out
+}
+
 export type LaneBatch<T> = { lane: string; items: T[] }
 
 export type LaneBatchPlan<T> = {
@@ -111,6 +144,8 @@ export function planLaneBatches<T>(
   capFor: (lane: string) => number,
   handled: number,
   maxPerInvocation: number,
+  /** Identity used for fairness (agent id). Omitted = FIFO, the old behaviour. */
+  keyOf?: (item: T) => string,
 ): LaneBatchPlan<T> {
   const batches: Array<LaneBatch<T>> = []
   const skipped: string[] = []
@@ -122,7 +157,8 @@ export function planLaneBatches<T>(
       skipped.push(lane)
       continue
     }
-    const items = laneItems.slice(0, capacity)
+    const ordered = keyOf ? interleaveByAgent(laneItems, keyOf) : laneItems
+    const items = ordered.slice(0, capacity)
     batches.push({ lane, items })
     reserved += items.length
   }
